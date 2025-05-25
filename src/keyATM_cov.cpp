@@ -15,6 +15,9 @@ void keyATMcov::read_data_specific()
   C = Rcpp::as<Eigen::MatrixXd>(C_r);
   num_cov = C.cols();
 
+  // Pre-compute C transpose for efficiency
+  C_transpose = C.transpose();
+
   // Slice Sampling
   val_min = model_settings["slice_min"];
   val_min = shrink(val_min, slice_A);
@@ -24,6 +27,10 @@ void keyATMcov::read_data_specific()
 
   // Metropolis Hastings
   mh_use = model_settings["mh_use"];
+  
+  // Pre-allocate likelihood computation vectors
+  doc_alpha_sums.resize(num_doc);
+  doc_alpha_weighted_sums.resize(num_doc);
 }
 
 
@@ -43,6 +50,11 @@ void keyATMcov::initialize_specific()
       Lambda(k, i) = R::rnorm(0.0, 0.3);
     }
   }
+  
+  // Pre-compute constants
+  sigma_squared = sigma * sigma;
+  inv_2sigma_squared = 1.0 / (2.0 * sigma_squared);
+  log_prior_const = -0.5 * log(2.0 * PI_V * sigma_squared);
 }
 
 
@@ -59,11 +71,16 @@ void keyATMcov::resume_initialize_specific()
   List Lambda_iter = stored_values["Lambda_iter"];
   NumericMatrix Lambda_r = Lambda_iter[Lambda_iter.size() - 1];
   Lambda = Rcpp::as<Eigen::MatrixXd>(Lambda_r);
+  
+  // Pre-compute constants
+  sigma_squared = sigma * sigma;
+  inv_2sigma_squared = 1.0 / (2.0 * sigma_squared);
+  log_prior_const = -0.5 * log(2.0 * PI_V * sigma_squared);
 }
 
 
 void keyATMcov::iteration_single(int it)
-{ // Single iteration
+{ 
   int doc_id_;
   int doc_length;
   int w_, z_, s_;
@@ -72,8 +89,8 @@ void keyATMcov::iteration_single(int it)
 
   doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
 
-  // Create Alpha for this iteration
-  Alpha = (C * Lambda.transpose()).array().exp();
+  // Create Alpha for this iteration - vectorized computation
+  update_alpha_efficient();
 
   for (int ii = 0; ii < num_doc; ++ii) {
     doc_id_ = doc_indexes[ii];
@@ -105,7 +122,20 @@ void keyATMcov::iteration_single(int it)
     S[doc_id_] = doc_s;
   }
   sample_parameters(it);
+}
 
+
+void keyATMcov::update_alpha_efficient()
+{
+  // Vectorized computation: Alpha = exp(C * Lambda^T)
+  // This replaces the element-wise computation in the original code
+  Alpha = (C * Lambda.transpose()).array().exp();
+  
+  // Pre-compute sums for likelihood computation
+  for (int d = 0; d < num_doc; ++d) {
+    doc_alpha_sums[d] = Alpha.row(d).sum();
+    doc_alpha_weighted_sums[d] = doc_each_len_weighted[d] + doc_alpha_sums[d];
+  }
 }
 
 
@@ -124,41 +154,55 @@ void keyATMcov::sample_parameters(int it)
 }
 
 
-double keyATMcov::likelihood_lambda(int k, int t)
+double keyATMcov::likelihood_lambda_efficient(int k, int t)
 {
   double loglik = 0.0;
-  Alpha = (C * Lambda.transpose()).array().exp();
-  alpha = VectorXd::Zero(num_topics);
-
+  
+  // Only update the affected column of Alpha
+  VectorXd C_col = C.col(t);
+  VectorXd lambda_k = Lambda.row(k).transpose();
+  
+  // Compute exp(C * lambda_k) efficiently
+  VectorXd alpha_k_new = (C * lambda_k).array().exp();
+  
+  // For each document, compute the likelihood contribution
   for (int d = 0; d < num_doc; ++d) {
-    alpha = Alpha.row(d).transpose(); // Doc alpha, column vector
-
-    loglik += mylgamma(alpha.sum());
-        // the first term numerator in the first square bracket
-    loglik -= mylgamma( doc_each_len_weighted[d] + alpha.sum() );
-        // the second term denoinator in the first square bracket
-
-    loglik -= mylgamma(alpha(k));
-    // the first term denominator in the first square bracket
-    loglik += mylgamma( n_dk(d, k) + alpha(k) );
-    // the second term numerator in the firist square bracket
+    double alpha_sum_old = doc_alpha_sums[d];
+    double alpha_k_old = Alpha(d, k);
+    double alpha_k_new_val = alpha_k_new(d);
+    double alpha_sum_new = alpha_sum_old - alpha_k_old + alpha_k_new_val;
+    
+    // Likelihood terms
+    loglik += mylgamma(alpha_sum_new) - mylgamma(doc_each_len_weighted[d] + alpha_sum_new);
+    loglik -= mylgamma(alpha_sum_old) - mylgamma(doc_each_len_weighted[d] + alpha_sum_old);
+    
+    loglik -= mylgamma(alpha_k_new_val) - mylgamma(alpha_k_old);
+    loglik += mylgamma(n_dk(d, k) + alpha_k_new_val) - mylgamma(n_dk(d, k) + alpha_k_old);
   }
 
   // Prior
-  loglik += -0.5 * log(2.0 * PI_V * std::pow(sigma, 2.0) );
-  loglik -= ( std::pow( (Lambda(k,t) - mu) , 2.0) / (2.0 * std::pow(sigma, 2.0)) );
+  loglik += log_prior_const;
+  double lambda_diff = Lambda(k, t) - mu;
+  loglik -= lambda_diff * lambda_diff * inv_2sigma_squared;
 
   return loglik;
 }
 
 
-void keyATMcov::sample_lambda()
+double keyATMcov::likelihood_lambda(int k, int t)
 {
-  mh_use ? sample_lambda_mh() : sample_lambda_slice();
+  // Use the efficient version
+  return likelihood_lambda_efficient(k, t);
 }
 
 
-void keyATMcov::sample_lambda_mh()
+void keyATMcov::sample_lambda()
+{
+  mh_use ? sample_lambda_mh_efficient() : sample_lambda_slice();
+}
+
+
+void keyATMcov::sample_lambda_mh_efficient()
 {
   topic_ids = sampler::shuffled_indexes(num_topics);
   cov_ids = sampler::shuffled_indexes(num_cov);
@@ -179,24 +223,52 @@ void keyATMcov::sample_lambda_mh()
 
       Lambda_current = Lambda(k, t);
 
-      // Current llk
-      llk_current = likelihood_lambda(k, t);
+      // Current llk - use efficient computation
+      llk_current = likelihood_lambda_efficient(k, t);
 
       // Proposal
-      Lambda(k, t) += R::rnorm(0.0, mh_sigma);
-      llk_proposal = likelihood_lambda(k, t);
+      double proposal_value = Lambda_current + R::rnorm(0.0, mh_sigma);
+      Lambda(k, t) = proposal_value;
+      
+      // Update Alpha for this change only
+      update_alpha_row_efficient(k);
+      
+      llk_proposal = likelihood_lambda_efficient(k, t);
 
       diffllk = llk_proposal - llk_current;
       r = std::min(0.0, diffllk);
       u = log(unif_rand());
 
       if (u < r) {
-        // accepted
+        // accepted - Alpha is already updated
       } else {
         // Put back original values
         Lambda(k, t) = Lambda_current;
+        update_alpha_row_efficient(k);
       }
     }
+  }
+}
+
+
+void keyATMcov::sample_lambda_mh()
+{
+  // Use the efficient version
+  sample_lambda_mh_efficient();
+}
+
+
+void keyATMcov::update_alpha_row_efficient(int k)
+{
+  // Update only row k of Alpha after Lambda(k, :) changes
+  VectorXd lambda_k = Lambda.row(k).transpose();
+  VectorXd new_alpha_k = (C * lambda_k).array().exp();
+  
+  // Update pre-computed sums
+  for (int d = 0; d < num_doc; ++d) {
+    doc_alpha_sums[d] = doc_alpha_sums[d] - Alpha(d, k) + new_alpha_k(d);
+    doc_alpha_weighted_sums[d] = doc_each_len_weighted[d] + doc_alpha_sums[d];
+    Alpha(d, k) = new_alpha_k(d);
   }
 }
 
@@ -228,7 +300,7 @@ void keyATMcov::sample_lambda_slice()
 
     for (int tt = 0; tt < num_cov; ++tt) {
       t = cov_ids[tt];
-      store_loglik = likelihood_lambda(k, t);
+      store_loglik = likelihood_lambda_efficient(k, t);
 
       start = val_min; // shrinked value
       end = val_max; // shrinked value
@@ -238,12 +310,14 @@ void keyATMcov::sample_lambda_slice()
       slice_ = store_loglik - std::log(A * previous_p * (1.0 - previous_p))
               + log(unif_rand()); // <-- using R random uniform
 
-
       for (int shrink_time = 0; shrink_time < max_shrink_time; ++shrink_time) {
         new_p = sampler::slice_uniform(start, end); // <-- using R function above
         Lambda(k,t) = expand(new_p, A); // expand
+        
+        // Update Alpha for this change
+        update_alpha_row_efficient(k);
 
-        newlambdallk = likelihood_lambda(k, t);
+        newlambdallk = likelihood_lambda_efficient(k, t);
 
         newlikelihood = newlambdallk - std::log(A * new_p * (1.0 - new_p));
 
@@ -252,6 +326,7 @@ void keyATMcov::sample_lambda_slice()
         } else if (abs(end - start) < 1e-9) {
           Rcerr << "Shrinked too much. Using a current value." << std::endl;
           Lambda(k,t) = current_lambda;
+          update_alpha_row_efficient(k);
           break;
         } else if (previous_p < new_p) {
           end = new_p;
@@ -260,9 +335,7 @@ void keyATMcov::sample_lambda_slice()
         } else {
           Rcpp::stop("Something goes wrong in sample_lambda_slice(). Adjust `A_slice`.");
         }
-
       } // for loop for shrink time
-
     } // for loop for num_cov
   } // for loop for num_topics
 }
@@ -288,7 +361,6 @@ double keyATMcov::loglik_total()
       }
       loglik += mylgamma( beta_s * (double)keywords_num[k] ) - mylgamma(beta_s * (double)keywords_num[k] + n_s1_k(k) );
 
-
       // Normalization
       loglik += mylgamma( prior_gamma(k, 0) + prior_gamma(k, 1)) - mylgamma( prior_gamma(k, 0)) - mylgamma( prior_gamma(k, 1));
 
@@ -299,31 +371,22 @@ double keyATMcov::loglik_total()
     }
   }
 
-
-  // z
-  Alpha = (C * Lambda.transpose()).array().exp();
-  alpha = VectorXd::Zero(num_topics);
-
+  // z - use pre-computed values
   for (int d = 0; d < num_doc; ++d) {
-    alpha = Alpha.row(d).transpose(); // Doc alpha, column vector
-
-    loglik += mylgamma( alpha.sum() ) - mylgamma( doc_each_len_weighted[d] + alpha.sum() );
+    loglik += mylgamma(doc_alpha_sums[d]) - mylgamma(doc_alpha_weighted_sums[d]);
     for (int k = 0; k < num_topics; ++k) {
-      loglik += mylgamma( n_dk(d,k) + alpha(k) ) - mylgamma( alpha(k) );
+      loglik += mylgamma(n_dk(d,k) + Alpha(d, k)) - mylgamma(Alpha(d, k));
     }
   }
 
-  // Lambda loglik
-  double prior_fixedterm = -0.5 * log(2.0 * PI_V * std::pow(sigma, 2.0) );
+  // Lambda loglik - vectorized computation
   for (int k = 0; k < num_topics; ++k) {
     for (int t = 0; t < num_cov; ++t) {
-      loglik += prior_fixedterm;
-      loglik -= ( std::pow( (Lambda(k,t) - mu) , 2.0) / (2.0 * std::pow(sigma, 2.0)) );
+      loglik += log_prior_const;
+      double lambda_diff = Lambda(k,t) - mu;
+      loglik -= lambda_diff * lambda_diff * inv_2sigma_squared;
     }
   }
 
   return loglik;
 }
-
-
-

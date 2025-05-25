@@ -22,10 +22,20 @@ class keyATMcov : virtual public keyATMmeta
     int num_cov;
     MatrixXd Lambda;
     MatrixXd C;
+    MatrixXd C_transpose; // Pre-computed transpose for efficiency
 
     int mh_use;
     double mu;
     double sigma;
+    
+    // Pre-computed constants for efficiency
+    double sigma_squared;
+    double inv_2sigma_squared;
+    double log_prior_const;
+    
+    // Pre-allocated vectors for likelihood computation
+    std::vector<double> doc_alpha_sums;
+    std::vector<double> doc_alpha_weighted_sums;
 
     // During the sampling
       std::vector<int> topic_ids;
@@ -55,6 +65,14 @@ class keyATMcov : virtual public keyATMmeta
     // Iteration
     virtual void iteration_single(int it) override;
     virtual void sample_parameters(int it) override final;
+    
+    // Optimized functions
+    void update_alpha_efficient();
+    void update_alpha_row_efficient(int k);
+    double likelihood_lambda_efficient(int k, int t);
+    void sample_lambda_mh_efficient();
+    
+    // Original functions (modified to use efficient versions)
     void sample_lambda();
     void sample_lambda_mh();
     void sample_lambda_slice();
