@@ -5,6 +5,8 @@
 #include <Rcpp.h>
 #include <RcppEigen.h>
 #include <unordered_set>
+#include <unordered_map>
+#include <cmath>
 #include "sampler.h"
 #include "keyATM_meta.h"
 
@@ -36,14 +38,19 @@ class keyATMcov : virtual public keyATMmeta
     // Pre-allocated vectors for likelihood computation
     std::vector<double> doc_alpha_sums;
     std::vector<double> doc_alpha_weighted_sums;
+    std::vector<double> temp_alpha_sums;
+    std::vector<double> temp_lgamma_cache;
+
+    // Cache for frequently computed lgamma values
+    std::unordered_map<int, double> lgamma_cache;
 
     // During the sampling
-      std::vector<int> topic_ids;
-      std::vector<int> cov_ids;
+    std::vector<int> topic_ids;
+    std::vector<int> cov_ids;
 
-      // Slice sampling
-      double val_min;
-      double val_max;
+    // Slice sampling
+    double val_min;
+    double val_max;
 
     //
     // Functions
@@ -66,13 +73,25 @@ class keyATMcov : virtual public keyATMmeta
     virtual void iteration_single(int it) override;
     virtual void sample_parameters(int it) override final;
     
-    // Optimized functions
+    // Optimized core functions
+    void update_alpha_vectorized();
+    void update_alpha_row_vectorized(int k);
+    double likelihood_lambda_vectorized(int k, int t);
+    void sample_lambda_optimized();
+    void sample_lambda_mh_vectorized();
+    void sample_lambda_slice_optimized();
+    double loglik_total_optimized();
+    
+    // Cached lgamma function
+    inline double cached_mylgamma(double x);
+    
+    // Legacy compatibility functions
     void update_alpha_efficient();
     void update_alpha_row_efficient(int k);
     double likelihood_lambda_efficient(int k, int t);
     void sample_lambda_mh_efficient();
     
-    // Original functions (modified to use efficient versions)
+    // Original functions (now calling optimized versions)
     void sample_lambda();
     void sample_lambda_mh();
     void sample_lambda_slice();

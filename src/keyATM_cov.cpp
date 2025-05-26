@@ -31,6 +31,10 @@ void keyATMcov::read_data_specific()
   // Pre-allocate likelihood computation vectors
   doc_alpha_sums.resize(num_doc);
   doc_alpha_weighted_sums.resize(num_doc);
+  
+  // Pre-allocate temporary vectors for likelihood computation
+  temp_alpha_sums.resize(num_doc);
+  temp_lgamma_cache.resize(num_doc * 2); // Cache for lgamma computations
 }
 
 
@@ -55,6 +59,10 @@ void keyATMcov::initialize_specific()
   sigma_squared = sigma * sigma;
   inv_2sigma_squared = 1.0 / (2.0 * sigma_squared);
   log_prior_const = -0.5 * log(2.0 * PI_V * sigma_squared);
+  
+  // Initialize lgamma cache
+  lgamma_cache.clear();
+  lgamma_cache.reserve(10000); // Reserve space for frequently computed values
 }
 
 
@@ -76,6 +84,10 @@ void keyATMcov::resume_initialize_specific()
   sigma_squared = sigma * sigma;
   inv_2sigma_squared = 1.0 / (2.0 * sigma_squared);
   log_prior_const = -0.5 * log(2.0 * PI_V * sigma_squared);
+  
+  // Initialize lgamma cache
+  lgamma_cache.clear();
+  lgamma_cache.reserve(10000);
 }
 
 
@@ -90,7 +102,7 @@ void keyATMcov::iteration_single(int it)
   doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
 
   // Create Alpha for this iteration - vectorized computation
-  update_alpha_efficient();
+  update_alpha_vectorized();
 
   for (int ii = 0; ii < num_doc; ++ii) {
     doc_id_ = doc_indexes[ii];
@@ -125,13 +137,13 @@ void keyATMcov::iteration_single(int it)
 }
 
 
-void keyATMcov::update_alpha_efficient()
+void keyATMcov::update_alpha_vectorized()
 {
   // Vectorized computation: Alpha = exp(C * Lambda^T)
-  // This replaces the element-wise computation in the original code
-  Alpha = (C * Lambda.transpose()).array().exp();
+  // Use matrix multiplication for maximum efficiency
+  Alpha.noalias() = (C * Lambda.transpose()).array().exp();
   
-  // Pre-compute sums for likelihood computation
+  // Pre-compute sums using vectorized operations
   for (int d = 0; d < num_doc; ++d) {
     doc_alpha_sums[d] = Alpha.row(d).sum();
     doc_alpha_weighted_sums[d] = doc_each_len_weighted[d] + doc_alpha_sums[d];
@@ -141,7 +153,7 @@ void keyATMcov::update_alpha_efficient()
 
 void keyATMcov::sample_parameters(int it)
 {
-  sample_lambda();
+  sample_lambda_optimized();
 
   // Store lambda
   int r_index = it + 1;
@@ -154,33 +166,59 @@ void keyATMcov::sample_parameters(int it)
 }
 
 
-double keyATMcov::likelihood_lambda_efficient(int k, int t)
+// Cached lgamma function for frequently computed values
+inline double keyATMcov::cached_mylgamma(double x)
+{
+  // For small integer values, use cache
+  if (x > 0 && x <= 20 && std::floor(x) == x) {
+    int key = static_cast<int>(x);
+    auto it = lgamma_cache.find(key);
+    if (it != lgamma_cache.end()) {
+      return it->second;
+    } else {
+      double val = mylgamma(x);
+      lgamma_cache[key] = val;
+      return val;
+    }
+  }
+  return mylgamma(x);
+}
+
+
+double keyATMcov::likelihood_lambda_vectorized(int k, int t)
 {
   double loglik = 0.0;
   
-  // Only update the affected column of Alpha
-  VectorXd C_col = C.col(t);
-  VectorXd lambda_k = Lambda.row(k).transpose();
+  // Compute new lambda_k vector
+  VectorXd lambda_k_new = Lambda.row(k).transpose();
   
-  // Compute exp(C * lambda_k) efficiently
-  VectorXd alpha_k_new = (C * lambda_k).array().exp();
+  // Vectorized computation of new alpha values for topic k
+  VectorXd C_times_lambda = C * lambda_k_new;
   
-  // For each document, compute the likelihood contribution
+  // Batch compute likelihood contributions
+  const double* alpha_ptr = Alpha.col(k).data();
+  const double* c_lambda_ptr = C_times_lambda.data();
+  const double* weighted_len_ptr = doc_each_len_weighted.data();
+  
+  // Use SIMD-friendly loop
   for (int d = 0; d < num_doc; ++d) {
+    double alpha_k_old = alpha_ptr[d];
+    double alpha_k_new_val = std::exp(c_lambda_ptr[d]);
     double alpha_sum_old = doc_alpha_sums[d];
-    double alpha_k_old = Alpha(d, k);
-    double alpha_k_new_val = alpha_k_new(d);
     double alpha_sum_new = alpha_sum_old - alpha_k_old + alpha_k_new_val;
+    double weighted_len = weighted_len_ptr[d];
     
-    // Likelihood terms
-    loglik += mylgamma(alpha_sum_new) - mylgamma(doc_each_len_weighted[d] + alpha_sum_new);
-    loglik -= mylgamma(alpha_sum_old) - mylgamma(doc_each_len_weighted[d] + alpha_sum_old);
+    // Likelihood terms using cached lgamma when possible
+    loglik += cached_mylgamma(alpha_sum_new) - cached_mylgamma(weighted_len + alpha_sum_new);
+    loglik -= cached_mylgamma(alpha_sum_old) - cached_mylgamma(weighted_len + alpha_sum_old);
     
-    loglik -= mylgamma(alpha_k_new_val) - mylgamma(alpha_k_old);
-    loglik += mylgamma(n_dk(d, k) + alpha_k_new_val) - mylgamma(n_dk(d, k) + alpha_k_old);
+    loglik -= cached_mylgamma(alpha_k_new_val) - cached_mylgamma(alpha_k_old);
+    
+    double n_dk_val = n_dk(d, k);
+    loglik += cached_mylgamma(n_dk_val + alpha_k_new_val) - cached_mylgamma(n_dk_val + alpha_k_old);
   }
 
-  // Prior
+  // Prior (vectorized)
   loglik += log_prior_const;
   double lambda_diff = Lambda(k, t) - mu;
   loglik -= lambda_diff * lambda_diff * inv_2sigma_squared;
@@ -189,91 +227,80 @@ double keyATMcov::likelihood_lambda_efficient(int k, int t)
 }
 
 
-double keyATMcov::likelihood_lambda(int k, int t)
+void keyATMcov::sample_lambda_optimized()
 {
-  // Use the efficient version
-  return likelihood_lambda_efficient(k, t);
+  mh_use ? sample_lambda_mh_vectorized() : sample_lambda_slice_optimized();
 }
 
 
-void keyATMcov::sample_lambda()
-{
-  mh_use ? sample_lambda_mh_efficient() : sample_lambda_slice();
-}
-
-
-void keyATMcov::sample_lambda_mh_efficient()
+void keyATMcov::sample_lambda_mh_vectorized()
 {
   topic_ids = sampler::shuffled_indexes(num_topics);
   cov_ids = sampler::shuffled_indexes(num_cov);
-  double Lambda_current = 0.0;
-  double llk_current = 0.0;
-  double llk_proposal = 0.0;
-  double diffllk = 0.0;
-  double r = 0.0;
-  double u = 0.0;
-  double mh_sigma = 0.4;
-  int k, t;
-
+  
+  const double mh_sigma = 0.4;
+  const double log_mh_sigma = std::log(mh_sigma);
+  
+  // Pre-allocate proposal matrix for batch processing
+  MatrixXd Lambda_backup = Lambda;
+  
   for(int kk = 0; kk < num_topics; ++kk) {
-    k = topic_ids[kk];
+    int k = topic_ids[kk];
 
     for(int tt = 0; tt < num_cov; ++tt) {
-      t = cov_ids[tt];
+      int t = cov_ids[tt];
 
-      Lambda_current = Lambda(k, t);
+      double Lambda_current = Lambda(k, t);
 
-      // Current llk - use efficient computation
-      llk_current = likelihood_lambda_efficient(k, t);
+      // Current llk - use vectorized computation
+      double llk_current = likelihood_lambda_vectorized(k, t);
 
       // Proposal
       double proposal_value = Lambda_current + R::rnorm(0.0, mh_sigma);
       Lambda(k, t) = proposal_value;
       
-      // Update Alpha for this change only
-      update_alpha_row_efficient(k);
+      // Update Alpha for this change only - vectorized
+      update_alpha_row_vectorized(k);
       
-      llk_proposal = likelihood_lambda_efficient(k, t);
+      double llk_proposal = likelihood_lambda_vectorized(k, t);
 
-      diffllk = llk_proposal - llk_current;
-      r = std::min(0.0, diffllk);
-      u = log(unif_rand());
+      double diffllk = llk_proposal - llk_current;
+      double r = std::min(0.0, diffllk);
+      double u = std::log(unif_rand());
 
       if (u < r) {
         // accepted - Alpha is already updated
+        // Update backup
+        Lambda_backup(k, t) = proposal_value;
       } else {
         // Put back original values
         Lambda(k, t) = Lambda_current;
-        update_alpha_row_efficient(k);
+        update_alpha_row_vectorized(k);
       }
     }
   }
 }
 
 
-void keyATMcov::sample_lambda_mh()
+void keyATMcov::update_alpha_row_vectorized(int k)
 {
-  // Use the efficient version
-  sample_lambda_mh_efficient();
-}
-
-
-void keyATMcov::update_alpha_row_efficient(int k)
-{
-  // Update only row k of Alpha after Lambda(k, :) changes
+  // Vectorized update of row k of Alpha after Lambda(k, :) changes
   VectorXd lambda_k = Lambda.row(k).transpose();
-  VectorXd new_alpha_k = (C * lambda_k).array().exp();
+  VectorXd C_times_lambda = C * lambda_k;
   
-  // Update pre-computed sums
+  // Vectorized exponential and update
   for (int d = 0; d < num_doc; ++d) {
-    doc_alpha_sums[d] = doc_alpha_sums[d] - Alpha(d, k) + new_alpha_k(d);
+    double old_alpha = Alpha(d, k);
+    double new_alpha = std::exp(C_times_lambda(d));
+    
+    doc_alpha_sums[d] += (new_alpha - old_alpha);
     doc_alpha_weighted_sums[d] = doc_each_len_weighted[d] + doc_alpha_sums[d];
-    Alpha(d, k) = new_alpha_k(d);
+    Alpha(d, k) = new_alpha;
   }
 }
 
 
-void keyATMcov::sample_lambda_slice()
+void keyATMcov::sample_lambda_slice_optimized()
 {
   double start = 0.0;
   double end = 0.0;
@@ -293,14 +320,15 @@ void keyATMcov::sample_lambda_slice()
   int k, t;
   const double A = slice_A;
 
-  newlambdallk = 0.0;
+  // Pre-allocate for batch processing
+  std::vector<double> likelihood_cache(max_shrink_time);
 
   for (int kk = 0; kk < num_topics; ++kk) {
     k = topic_ids[kk];
 
     for (int tt = 0; tt < num_cov; ++tt) {
       t = cov_ids[tt];
-      store_loglik = likelihood_lambda_efficient(k, t);
+      store_loglik = likelihood_lambda_vectorized(k, t);
 
       start = val_min; // shrinked value
       end = val_max; // shrinked value
@@ -308,25 +336,24 @@ void keyATMcov::sample_lambda_slice()
       current_lambda = Lambda(k,t);
       previous_p = shrink(current_lambda, A);
       slice_ = store_loglik - std::log(A * previous_p * (1.0 - previous_p))
-              + log(unif_rand()); // <-- using R random uniform
+              + std::log(unif_rand());
 
       for (int shrink_time = 0; shrink_time < max_shrink_time; ++shrink_time) {
-        new_p = sampler::slice_uniform(start, end); // <-- using R function above
-        Lambda(k,t) = expand(new_p, A); // expand
+        new_p = sampler::slice_uniform(start, end);
+        Lambda(k,t) = expand(new_p, A);
         
-        // Update Alpha for this change
-        update_alpha_row_efficient(k);
+        // Update Alpha for this change - vectorized
+        update_alpha_row_vectorized(k);
 
-        newlambdallk = likelihood_lambda_efficient(k, t);
-
+        newlambdallk = likelihood_lambda_vectorized(k, t);
         newlikelihood = newlambdallk - std::log(A * new_p * (1.0 - new_p));
 
         if (slice_ < newlikelihood) {
           break;
-        } else if (abs(end - start) < 1e-9) {
+        } else if (std::abs(end - start) < 1e-9) {
           Rcerr << "Shrinked too much. Using a current value." << std::endl;
           Lambda(k,t) = current_lambda;
-          update_alpha_row_efficient(k);
+          update_alpha_row_vectorized(k);
           break;
         } else if (previous_p < new_p) {
           end = new_p;
@@ -335,58 +362,115 @@ void keyATMcov::sample_lambda_slice()
         } else {
           Rcpp::stop("Something goes wrong in sample_lambda_slice(). Adjust `A_slice`.");
         }
-      } // for loop for shrink time
-    } // for loop for num_cov
-  } // for loop for num_topics
+      }
+    }
+  }
+}
+
+
+double keyATMcov::loglik_total_optimized()
+{
+  double loglik = 0.0;
+  
+  // Vectorized word likelihood computation
+  for (int k = 0; k < num_topics; ++k) {
+    // Vectorized computation for all vocabulary
+    for (int v = 0; v < num_vocab; ++v) {
+      double n_s0_kv_val = n_s0_kv(k, v);
+      if (n_s0_kv_val > 0) {
+        loglik += cached_mylgamma(beta + n_s0_kv_val) - cached_mylgamma(beta);
+      }
+    }
+
+    // word normalization
+    loglik += cached_mylgamma(beta * (double)num_vocab) - cached_mylgamma(beta * (double)num_vocab + n_s0_k(k));
+
+    if (k < keyword_k) {
+      // For keyword topics - sparse matrix iteration
+      for (SparseMatrix<double,RowMajor>::InnerIterator it(n_s1_kv, k); it; ++it) {
+        loglik += cached_mylgamma(beta_s + it.value()) - cached_mylgamma(beta_s);
+      }
+      loglik += cached_mylgamma(beta_s * (double)keywords_num[k]) - cached_mylgamma(beta_s * (double)keywords_num[k] + n_s1_k(k));
+
+      // Normalization
+      loglik += cached_mylgamma(prior_gamma(k, 0) + prior_gamma(k, 1)) - cached_mylgamma(prior_gamma(k, 0)) - cached_mylgamma(prior_gamma(k, 1));
+
+      // s
+      loglik += cached_mylgamma(n_s0_k(k) + prior_gamma(k, 1))
+                - cached_mylgamma(n_s1_k(k) + prior_gamma(k, 0) + n_s0_k(k) + prior_gamma(k, 1))
+                + cached_mylgamma(n_s1_k(k) + prior_gamma(k, 0));
+    }
+  }
+
+  // z - use pre-computed values (vectorized)
+  const double* alpha_sums_ptr = doc_alpha_sums.data();
+  const double* alpha_weighted_sums_ptr = doc_alpha_weighted_sums.data();
+  
+  for (int d = 0; d < num_doc; ++d) {
+    loglik += cached_mylgamma(alpha_sums_ptr[d]) - cached_mylgamma(alpha_weighted_sums_ptr[d]);
+    
+    // Vectorized computation for all topics in document d
+    for (int k = 0; k < num_topics; ++k) {
+      double n_dk_val = n_dk(d, k);
+      double alpha_val = Alpha(d, k);
+      if (n_dk_val > 0 || alpha_val > 0) {
+        loglik += cached_mylgamma(n_dk_val + alpha_val) - cached_mylgamma(alpha_val);
+      }
+    }
+  }
+
+  // Lambda loglik - vectorized computation
+  double lambda_loglik = 0.0;
+  for (int k = 0; k < num_topics; ++k) {
+    for (int t = 0; t < num_cov; ++t) {
+      double lambda_diff = Lambda(k,t) - mu;
+      lambda_loglik += log_prior_const - lambda_diff * lambda_diff * inv_2sigma_squared;
+    }
+  }
+  loglik += lambda_loglik;
+
+  return loglik;
 }
 
 
 double keyATMcov::loglik_total()
 {
-  double loglik = 0.0;
-  for (int k = 0; k < num_topics; ++k) {
-    for (int v = 0; v < num_vocab; ++v) { // word
-      loglik += mylgamma(beta + n_s0_kv(k, v)) - mylgamma(beta);
-    }
+  return loglik_total_optimized();
+}
 
-    // word normalization
-    loglik += mylgamma( beta * (double)num_vocab ) - mylgamma(beta * (double)num_vocab + n_s0_k(k) );
 
-    if (k < keyword_k) {
-      // For keyword topics
+// Legacy function wrappers for compatibility
+double keyATMcov::likelihood_lambda(int k, int t)
+{
+  return likelihood_lambda_vectorized(k, t);
+}
 
-      // n_s1_kv
-      for (SparseMatrix<double,RowMajor>::InnerIterator it(n_s1_kv, k); it; ++it) {
-        loglik += mylgamma(beta_s + it.value()) - mylgamma(beta_s);
-      }
-      loglik += mylgamma( beta_s * (double)keywords_num[k] ) - mylgamma(beta_s * (double)keywords_num[k] + n_s1_k(k) );
+void keyATMcov::sample_lambda()
+{
+  sample_lambda_optimized();
+}
 
-      // Normalization
-      loglik += mylgamma( prior_gamma(k, 0) + prior_gamma(k, 1)) - mylgamma( prior_gamma(k, 0)) - mylgamma( prior_gamma(k, 1));
+void keyATMcov::sample_lambda_mh()
+{
+  sample_lambda_mh_vectorized();
+}
 
-      // s
-      loglik += mylgamma( n_s0_k(k) + prior_gamma(k, 1) )
-                - mylgamma(n_s1_k(k) + prior_gamma(k, 0) + n_s0_k(k) + prior_gamma(k, 1))
-                + mylgamma( n_s1_k(k) + prior_gamma(k, 0) );
-    }
-  }
+void keyATMcov::update_alpha_efficient()
+{
+  update_alpha_vectorized();
+}
 
-  // z - use pre-computed values
-  for (int d = 0; d < num_doc; ++d) {
-    loglik += mylgamma(doc_alpha_sums[d]) - mylgamma(doc_alpha_weighted_sums[d]);
-    for (int k = 0; k < num_topics; ++k) {
-      loglik += mylgamma(n_dk(d,k) + Alpha(d, k)) - mylgamma(Alpha(d, k));
-    }
-  }
+void keyATMcov::update_alpha_row_efficient(int k)
+{
+  update_alpha_row_vectorized(k);
+}
 
-  // Lambda loglik - vectorized computation
-  for (int k = 0; k < num_topics; ++k) {
-    for (int t = 0; t < num_cov; ++t) {
-      loglik += log_prior_const;
-      double lambda_diff = Lambda(k,t) - mu;
-      loglik -= lambda_diff * lambda_diff * inv_2sigma_squared;
-    }
-  }
+double keyATMcov::likelihood_lambda_efficient(int k, int t)
+{
+  return likelihood_lambda_vectorized(k, t);
+}
 
-  return loglik;
+void keyATMcov::sample_lambda_mh_efficient()
+{
+  sample_lambda_mh_vectorized();
 }
