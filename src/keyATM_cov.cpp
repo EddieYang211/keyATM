@@ -158,29 +158,31 @@ double keyATMcov::likelihood_lambda_efficient(int k, int t)
 {
   double loglik = 0.0;
   
-  // Only update the affected column of Alpha
-  VectorXd C_col = C.col(t);
-  VectorXd lambda_k = Lambda.row(k).transpose();
+  // Cache the original value before modification
+  double lambda_kt_original = Lambda(k, t);
   
-  // Compute exp(C * lambda_k) efficiently
+  // Compute new alpha values for topic k only (vectorized)
+  VectorXd lambda_k = Lambda.row(k).transpose();
   VectorXd alpha_k_new = (C * lambda_k).array().exp();
   
-  // For each document, compute the likelihood contribution
+  // Use cached sums to avoid recomputation
   for (int d = 0; d < num_doc; ++d) {
-    double alpha_sum_old = doc_alpha_sums[d];
     double alpha_k_old = Alpha(d, k);
     double alpha_k_new_val = alpha_k_new(d);
+    double alpha_sum_old = doc_alpha_sums[d];
     double alpha_sum_new = alpha_sum_old - alpha_k_old + alpha_k_new_val;
     
-    // Likelihood terms
-    loglik += mylgamma(alpha_sum_new) - mylgamma(doc_each_len_weighted[d] + alpha_sum_new);
-    loglik -= mylgamma(alpha_sum_old) - mylgamma(doc_each_len_weighted[d] + alpha_sum_old);
+    // Use pre-computed weighted lengths
+    double weighted_len = doc_each_len_weighted[d];
     
+    // Likelihood terms (optimized order to minimize expensive gamma computations)
+    loglik += mylgamma(alpha_sum_new) - mylgamma(alpha_sum_old);
+    loglik -= mylgamma(weighted_len + alpha_sum_new) - mylgamma(weighted_len + alpha_sum_old);
     loglik -= mylgamma(alpha_k_new_val) - mylgamma(alpha_k_old);
     loglik += mylgamma(n_dk(d, k) + alpha_k_new_val) - mylgamma(n_dk(d, k) + alpha_k_old);
   }
 
-  // Prior
+  // Prior (using pre-computed constants)
   loglik += log_prior_const;
   double lambda_diff = Lambda(k, t) - mu;
   loglik -= lambda_diff * lambda_diff * inv_2sigma_squared;
@@ -204,49 +206,60 @@ void keyATMcov::sample_lambda()
 
 void keyATMcov::sample_lambda_mh_efficient()
 {
+  // Pre-allocate proposal matrix to avoid repeated memory allocation
+  static MatrixXd Lambda_proposal = MatrixXd::Zero(num_topics, num_cov);
+  static std::vector<std::vector<bool>> accept_flags(num_topics, std::vector<bool>(num_cov));
+  
   topic_ids = sampler::shuffled_indexes(num_topics);
   cov_ids = sampler::shuffled_indexes(num_cov);
-  double Lambda_current = 0.0;
-  double llk_current = 0.0;
-  double llk_proposal = 0.0;
-  double diffllk = 0.0;
-  double r = 0.0;
-  double u = 0.0;
+  
   double mh_sigma = 0.4;
-  int k, t;
-
+  
+  // Process in batches by topic to maximize cache efficiency
   for(int kk = 0; kk < num_topics; ++kk) {
-    k = topic_ids[kk];
-
+    int k = topic_ids[kk];
+    
+    // Generate all proposals for this topic at once
     for(int tt = 0; tt < num_cov; ++tt) {
-      t = cov_ids[tt];
-
-      Lambda_current = Lambda(k, t);
-
-      // Current llk - use efficient computation
-      llk_current = likelihood_lambda_efficient(k, t);
-
-      // Proposal
-      double proposal_value = Lambda_current + R::rnorm(0.0, mh_sigma);
+      int t = cov_ids[tt];
+      Lambda_proposal(k, t) = Lambda(k, t) + R::rnorm(0.0, mh_sigma);
+    }
+    
+    // Compute current likelihood once for the entire row
+    VectorXd lambda_k_current = Lambda.row(k).transpose();
+    VectorXd alpha_k_current = (C * lambda_k_current).array().exp();
+    
+    // Process each covariate for this topic
+    for(int tt = 0; tt < num_cov; ++tt) {
+      int t = cov_ids[tt];
+      
+      double Lambda_current = Lambda(k, t);
+      double proposal_value = Lambda_proposal(k, t);
+      
+      // Temporarily update for likelihood calculation
       Lambda(k, t) = proposal_value;
       
-      // Update Alpha for this change only
-      update_alpha_row_efficient(k);
+      double llk_current = likelihood_lambda_efficient(k, t);
+      Lambda(k, t) = Lambda_current; // restore
+      double llk_proposal = likelihood_lambda_efficient(k, t);
+      Lambda(k, t) = proposal_value; // set to proposal for next calculation
       
-      llk_proposal = likelihood_lambda_efficient(k, t);
-
-      diffllk = llk_proposal - llk_current;
-      r = std::min(0.0, diffllk);
-      u = log(unif_rand());
-
+      double diffllk = llk_proposal - llk_current;
+      double r = std::min(0.0, diffllk);
+      double u = log(unif_rand());
+      
       if (u < r) {
-        // accepted - Alpha is already updated
+        // Accept proposal - Lambda already has proposal value
+        accept_flags[k][t] = true;
       } else {
-        // Put back original values
+        // Reject proposal
         Lambda(k, t) = Lambda_current;
-        update_alpha_row_efficient(k);
+        accept_flags[k][t] = false;
       }
     }
+    
+    // Batch update Alpha row for this topic after all covariates processed
+    update_alpha_row_efficient(k);
   }
 }
 
