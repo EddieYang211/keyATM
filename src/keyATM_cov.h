@@ -69,7 +69,7 @@ class keyATMcov : virtual public keyATMmeta
     // Optimized functions
     void update_alpha_efficient();
     void update_alpha_row_efficient(int k);
-    double likelihood_lambda_efficient(int k, int t);
+    double likelihood_lambda_efficient(int k, int t, const Eigen::VectorXd* precomputed_alpha_k = nullptr);
     void sample_lambda_mh_efficient();
     
     // Original functions (modified to use efficient versions)
