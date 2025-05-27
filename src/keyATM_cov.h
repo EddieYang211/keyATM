@@ -34,8 +34,8 @@ class keyATMcov : virtual public keyATMmeta
     double log_prior_const;
     
     // Pre-allocated vectors for likelihood computation
-    std::vector<double> doc_alpha_sums;
-    std::vector<double> doc_alpha_weighted_sums;
+    Eigen::VectorXd doc_alpha_sums;
+    Eigen::VectorXd doc_alpha_weighted_sums;
 
     // During the sampling
       std::vector<int> topic_ids;
@@ -81,6 +81,11 @@ class keyATMcov : virtual public keyATMmeta
 
     double likelihood_lambda(int k, int t);
     void proposal_lambda(int k);
+
+  private:
+    // Helper function for likelihood computation
+    double compute_likelihood_terms(int k, int t, double current_lambda_kt_val,
+                                    const Eigen::VectorXd& current_alpha_k_vec);
 };
 
 

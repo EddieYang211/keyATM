@@ -79,6 +79,39 @@ void keyATMcov::resume_initialize_specific()
 }
 
 
+// Helper function to compute log-likelihood terms relevant to Lambda(k,t)
+double keyATMcov::compute_likelihood_terms(int k, int t, double current_lambda_kt_val,
+                                           const Eigen::VectorXd& current_alpha_k_vec)
+{
+  double loglik = 0.0;
+
+  for (int d = 0; d < num_doc; ++d) {
+    // Alpha(d, k) and doc_alpha_sums[d] are from the global state, reflecting Alpha values
+    // *before* the current specific Lambda(k,t) proposal is evaluated.
+    double alpha_k_old_from_global_Alpha = Alpha(d, k); 
+    double current_eval_alpha_dk = current_alpha_k_vec(d); // Alpha(d,k) if current_lambda_kt_val is used
+
+    double alpha_sum_old_overall = doc_alpha_sums[d]; // Based on global Alpha
+    // Calculate new sum_alpha_d if Alpha(d,k) changes from global Alpha(d,k) to current_eval_alpha_dk
+    double alpha_sum_new_overall = alpha_sum_old_overall - alpha_k_old_from_global_Alpha + current_eval_alpha_dk;
+    
+    double weighted_len = doc_each_len_weighted[d];
+    
+    loglik += mylgamma(alpha_sum_new_overall) - mylgamma(alpha_sum_old_overall);
+    loglik -= mylgamma(weighted_len + alpha_sum_new_overall) - mylgamma(weighted_len + alpha_sum_old_overall);
+    loglik -= mylgamma(current_eval_alpha_dk) - mylgamma(alpha_k_old_from_global_Alpha);
+    loglik += mylgamma(n_dk(d, k) + current_eval_alpha_dk) - mylgamma(n_dk(d, k) + alpha_k_old_from_global_Alpha);
+  }
+
+  // Prior for Lambda(k,t)
+  loglik += log_prior_const;
+  double lambda_diff = current_lambda_kt_val - mu;
+  loglik -= lambda_diff * lambda_diff * inv_2sigma_squared;
+
+  return loglik;
+}
+
+
 void keyATMcov::iteration_single(int it)
 { 
   int doc_id_;
@@ -128,13 +161,42 @@ void keyATMcov::iteration_single(int it)
 void keyATMcov::update_alpha_efficient()
 {
   // Vectorized computation: Alpha = exp(C * Lambda^T)
-  // This replaces the element-wise computation in the original code
   Alpha = (C * Lambda.transpose()).array().exp();
   
   // Pre-compute sums for likelihood computation
-  for (int d = 0; d < num_doc; ++d) {
-    doc_alpha_sums[d] = Alpha.row(d).sum();
-    doc_alpha_weighted_sums[d] = doc_each_len_weighted[d] + doc_alpha_sums[d];
+  if (num_doc > 0 && Alpha.rows() == num_doc && Alpha.cols() == num_topics) { // Check dimensions
+    doc_alpha_sums = Alpha.rowwise().sum(); // Should now work with Eigen::VectorXd
+    if (doc_each_len_weighted.size() == num_doc && doc_alpha_sums.size() == num_doc) {
+        // Assuming doc_each_len_weighted is std::vector<double>
+        Eigen::VectorXd doc_each_len_weighted_eigen = Eigen::Map<const Eigen::VectorXd>(doc_each_len_weighted.data(), doc_each_len_weighted.size());
+        doc_alpha_weighted_sums = doc_each_len_weighted_eigen.array() + doc_alpha_sums.array(); // Should now work
+    } else {
+        // Handle size mismatch, perhaps by re-initializing or erroring
+        if (doc_each_len_weighted.size() != num_doc) {
+             Rcpp::Rcerr << "Dimension mismatch: doc_each_len_weighted.size() (" << doc_each_len_weighted.size() 
+                         << ") != num_doc (" << num_doc << ")" << std::endl;
+        }
+        if (doc_alpha_sums.size() != num_doc) {
+            Rcpp::Rcerr << "Dimension mismatch: doc_alpha_sums.size() (" << doc_alpha_sums.size() 
+                        << ") != num_doc (" << num_doc << ")" << std::endl;
+        }
+        // Fallback or error, ensure vectors are correctly sized if proceeding
+        // For safety, one might re-initialize or use the loop if checks fail,
+        // or throw an error. If doc_each_len_weighted is std::vector, conversion is needed.
+        // For now, assuming it's compatible for direct Eigen operations.
+    }
+  } else { // Fallback to loop if num_doc is 0 or Alpha dimensions are unexpected
+      // If using Eigen::VectorXd, direct assignment from sum is better than loop
+      // This manual loop would be inefficient if sizes are large and types are Eigen.
+      // However, if the intention is a safe fallback for small/problematic cases:
+      if (num_doc > 0) { // Guard against num_doc = 0 for Alpha.row(d)
+        for (int d = 0; d < num_doc; ++d) {
+          if (d < doc_alpha_sums.size()) doc_alpha_sums(d) = Alpha.row(d).sum();
+          if (d < doc_alpha_weighted_sums.size() && d < doc_each_len_weighted.size() && d < doc_alpha_sums.size()) {
+             doc_alpha_weighted_sums(d) = doc_each_len_weighted[d] + doc_alpha_sums(d); // Changed (d) to [d] for std::vector
+          }
+        }
+      }
   }
 }
 
@@ -158,34 +220,16 @@ double keyATMcov::likelihood_lambda_efficient(int k, int t)
 {
   double loglik = 0.0;
   
-  // Cache the original value before modification
-  double lambda_kt_original = Lambda(k, t);
-  
-  // Compute new alpha values for topic k only (vectorized)
-  VectorXd lambda_k = Lambda.row(k).transpose();
-  VectorXd alpha_k_new = (C * lambda_k).array().exp();
-  
-  // Use cached sums to avoid recomputation
-  for (int d = 0; d < num_doc; ++d) {
-    double alpha_k_old = Alpha(d, k);
-    double alpha_k_new_val = alpha_k_new(d);
-    double alpha_sum_old = doc_alpha_sums[d];
-    double alpha_sum_new = alpha_sum_old - alpha_k_old + alpha_k_new_val;
-    
-    // Use pre-computed weighted lengths
-    double weighted_len = doc_each_len_weighted[d];
-    
-    // Likelihood terms (optimized order to minimize expensive gamma computations)
-    loglik += mylgamma(alpha_sum_new) - mylgamma(alpha_sum_old);
-    loglik -= mylgamma(weighted_len + alpha_sum_new) - mylgamma(weighted_len + alpha_sum_old);
-    loglik -= mylgamma(alpha_k_new_val) - mylgamma(alpha_k_old);
-    loglik += mylgamma(n_dk(d, k) + alpha_k_new_val) - mylgamma(n_dk(d, k) + alpha_k_old);
-  }
+  // This function computes the full conditional log-likelihood for Lambda(k,t)
+  // given the current state of Lambda.row(k) (which includes the current Lambda(k,t)).
+  // It uses the global Alpha and doc_alpha_sums as the baseline.
 
-  // Prior (using pre-computed constants)
-  loglik += log_prior_const;
-  double lambda_diff = Lambda(k, t) - mu;
-  loglik -= lambda_diff * lambda_diff * inv_2sigma_squared;
+  // Compute new alpha values for topic k based on current Lambda.row(k)
+  VectorXd current_lambda_k_row = Lambda.row(k).transpose();
+  VectorXd current_alpha_k_for_eval = (C * current_lambda_k_row).array().exp(); // O(num_doc * num_cov)
+  
+  // Use the helper function by passing the computed current_alpha_k_for_eval
+  loglik = compute_likelihood_terms(k, t, Lambda(k,t), current_alpha_k_for_eval);
 
   return loglik;
 }
@@ -206,60 +250,74 @@ void keyATMcov::sample_lambda()
 
 void keyATMcov::sample_lambda_mh_efficient()
 {
-  // Pre-allocate proposal matrix to avoid repeated memory allocation
-  static MatrixXd Lambda_proposal = MatrixXd::Zero(num_topics, num_cov);
-  static std::vector<std::vector<bool>> accept_flags(num_topics, std::vector<bool>(num_cov));
+  // No static Lambda_proposal, it depends on current Lambda(k,t)
+  // static MatrixXd Lambda_proposal = MatrixXd::Zero(num_topics, num_cov);
+  std::vector<std::vector<bool>> accept_flags(num_topics, std::vector<bool>(num_cov, false));
   
   topic_ids = sampler::shuffled_indexes(num_topics);
-  cov_ids = sampler::shuffled_indexes(num_cov);
+  // cov_ids can be shuffled per topic or globally, original shuffles globally once
+  // Shuffling cov_ids per topic k might be slightly better for cache if C.col(t) is accessed.
+  // For now, stick to global shuffle of cov_ids as original.
+  cov_ids = sampler::shuffled_indexes(num_cov); 
   
   double mh_sigma = 0.4;
   
-  // Process in batches by topic to maximize cache efficiency
   for(int kk = 0; kk < num_topics; ++kk) {
     int k = topic_ids[kk];
     
-    // Generate all proposals for this topic at once
-    for(int tt = 0; tt < num_cov; ++tt) {
-      int t = cov_ids[tt];
-      Lambda_proposal(k, t) = Lambda(k, t) + R::rnorm(0.0, mh_sigma);
-    }
+    // Current log(Alpha.col(k)) based on accepted Lambda.row(k) for this topic
+    // This is O(num_doc * num_cov) once per topic k
+    VectorXd log_alpha_k_current = C * Lambda.row(k).transpose(); 
+    VectorXd alpha_k_current_iter_vec = log_alpha_k_current.array().exp();
     
-    // Compute current likelihood once for the entire row
-    VectorXd lambda_k_current = Lambda.row(k).transpose();
-    VectorXd alpha_k_current = (C * lambda_k_current).array().exp();
-    
-    // Process each covariate for this topic
     for(int tt = 0; tt < num_cov; ++tt) {
       int t = cov_ids[tt];
       
-      double Lambda_current = Lambda(k, t);
-      double proposal_value = Lambda_proposal(k, t);
+      double Lambda_kt_original_val = Lambda(k, t); // Current value from Lambda matrix
+      // Proposal is generated based on the current state of Lambda(k,t)
+      double Lambda_kt_proposal_val = Lambda_kt_original_val + R::rnorm(0.0, mh_sigma);
       
-      // Temporarily update for likelihood calculation
-      Lambda(k, t) = proposal_value;
+      // Calculate llk for original Lambda(k,t) using current alpha_k vector for this topic
+      // compute_likelihood_terms uses global Alpha and doc_alpha_sums as baseline
+      double llk_original = compute_likelihood_terms(k, t, Lambda_kt_original_val, alpha_k_current_iter_vec);
       
-      double llk_current = likelihood_lambda_efficient(k, t);
-      Lambda(k, t) = Lambda_current; // restore
-      double llk_proposal = likelihood_lambda_efficient(k, t);
-      Lambda(k, t) = proposal_value; // set to proposal for next calculation
+      // Efficiently calculate alpha_k vector for the proposal
+      double delta_lambda = Lambda_kt_proposal_val - Lambda_kt_original_val;
+      // C.col(t) is num_doc x 1. delta_lambda is scalar. Result is num_doc x 1.
+      VectorXd alpha_k_proposal_vec = alpha_k_current_iter_vec.array() * (C.col(t) * delta_lambda).array().exp(); // O(num_doc)
       
-      double diffllk = llk_proposal - llk_current;
-      double r = std::min(0.0, diffllk);
-      double u = log(unif_rand());
+      // Calculate llk for proposed Lambda(k,t)
+      double llk_proposal = compute_likelihood_terms(k, t, Lambda_kt_proposal_val, alpha_k_proposal_vec);
       
-      if (u < r) {
-        // Accept proposal - Lambda already has proposal value
+      double diffllk = llk_proposal - llk_original;
+      // Using r_val to avoid conflict with R::
+      double r_val = std::min(0.0, diffllk); // log(min(1, ratio))
+      double u = log(R::unif_rand()); // log of uniform_rand
+      
+      if (u < r_val) {
+        // Accept proposal
+        Lambda(k, t) = Lambda_kt_proposal_val;
         accept_flags[k][t] = true;
+        // Update the base log_alpha_k and alpha_k_current_iter_vec for the next t in THIS topic k
+        log_alpha_k_current += C.col(t) * delta_lambda; // O(num_doc)
+        alpha_k_current_iter_vec = log_alpha_k_current.array().exp(); // O(num_doc)
+        // More direct: alpha_k_current_iter_vec = alpha_k_proposal_vec;
       } else {
-        // Reject proposal
-        Lambda(k, t) = Lambda_current;
+        // Reject proposal: Lambda(k,t) remains Lambda_kt_original_val.
+        // log_alpha_k_current and alpha_k_current_iter_vec remain unchanged.
         accept_flags[k][t] = false;
       }
     }
     
-    // Batch update Alpha row for this topic after all covariates processed
-    update_alpha_row_efficient(k);
+    // After all covariates 't' for topic 'k' are processed, Lambda.row(k) has its new values.
+    // Update the k-th column of global Alpha matrix and related doc_alpha_sums
+    // using the final alpha_k_current_iter_vec for this topic.
+    // This replaces the old update_alpha_row_efficient(k) call more efficiently.
+    for (int d = 0; d < num_doc; ++d) {
+      doc_alpha_sums[d] = doc_alpha_sums[d] - Alpha(d, k) + alpha_k_current_iter_vec(d);
+      doc_alpha_weighted_sums[d] = doc_each_len_weighted[d] + doc_alpha_sums[d]; // Update weighted sum too
+      Alpha(d, k) = alpha_k_current_iter_vec(d);
+    }
   }
 }
 
@@ -274,83 +332,136 @@ void keyATMcov::sample_lambda_mh()
 void keyATMcov::update_alpha_row_efficient(int k)
 {
   // Update only row k of Alpha after Lambda(k, :) changes
+  // This function is now effectively integrated into sample_lambda_mh_efficient and sample_lambda_slice's logic
+  // by updating alpha_k_current_iter_vec and then applying it to global Alpha and sums.
+  // It can be kept for other potential uses or if direct full row update is needed elsewhere,
+  // but the optimized samplers manage this update more incrementally or at end of topic processing.
   VectorXd lambda_k = Lambda.row(k).transpose();
-  VectorXd new_alpha_k = (C * lambda_k).array().exp();
+  VectorXd new_alpha_k_col = (C * lambda_k).array().exp(); // This is Alpha.col(k)
   
-  // Update pre-computed sums
+  // Update pre-computed sums and Alpha's k-th column
   for (int d = 0; d < num_doc; ++d) {
-    doc_alpha_sums[d] = doc_alpha_sums[d] - Alpha(d, k) + new_alpha_k(d);
+    doc_alpha_sums[d] = doc_alpha_sums[d] - Alpha(d, k) + new_alpha_k_col(d);
     doc_alpha_weighted_sums[d] = doc_each_len_weighted[d] + doc_alpha_sums[d];
-    Alpha(d, k) = new_alpha_k(d);
+    Alpha(d, k) = new_alpha_k_col(d);
   }
 }
 
 
 void keyATMcov::sample_lambda_slice()
 {
-  double start = 0.0;
-  double end = 0.0;
+  double start_p, end_p; // Renamed to avoid conflict with Eigen::VectorXd::end()
 
-  double previous_p = 0.0;
-  double new_p = 0.0;
+  double previous_p_val = 0.0; // Renamed
+  double new_p_val = 0.0; // Renamed
 
-  double newlikelihood = 0.0;
-  double slice_ = 0.0;
-  double current_lambda = 0.0;
+  // double newlikelihood = 0.0; // Not directly used in this form
+  double slice_level = 0.0; // Renamed
+  // double current_lambda = 0.0; // Will be Lambda(k,t)
 
-  double store_loglik;
-  double newlambdallk;
+  // double store_loglik; // Will be log_f_x0
+  // double newlambdallk; // Will be log_f_proposed
 
   topic_ids = sampler::shuffled_indexes(num_topics);
-  cov_ids = sampler::shuffled_indexes(num_cov);
+  cov_ids = sampler::shuffled_indexes(num_cov); // Global shuffle as original
   int k, t;
-  const double A = slice_A;
+  const double A = slice_A; // Shrink/expand factor from model_settings
 
-  newlambdallk = 0.0;
+  // newlambdallk = 0.0; // Not needed here
 
   for (int kk = 0; kk < num_topics; ++kk) {
     k = topic_ids[kk];
 
+    // Current log(Alpha.col(k)) based on accepted Lambda.row(k) values for this topic
+    // This is O(num_doc * num_cov) once per topic k
+    VectorXd log_alpha_k_topic_base = C * Lambda.row(k).transpose();
+    VectorXd alpha_k_topic_base_vec = log_alpha_k_topic_base.array().exp();
+
     for (int tt = 0; tt < num_cov; ++tt) {
       t = cov_ids[tt];
-      store_loglik = likelihood_lambda_efficient(k, t);
+      
+      double original_Lambda_kt = Lambda(k,t); // Current value of Lambda(k,t) for this step
+      VectorXd alpha_k_iter_vec = alpha_k_topic_base_vec; // Start with base for this (k,t)
+                                                          // This will track Alpha.col(k) if original_Lambda_kt is kept
 
-      start = val_min; // shrinked value
-      end = val_max; // shrinked value
+      // Calculate log f(x_0) + log |dx_0/dp_0| for slice definition
+      // Here, x_0 is original_Lambda_kt
+      previous_p_val = shrink(original_Lambda_kt, A);
+      double log_f_x0 = compute_likelihood_terms(k, t, original_Lambda_kt, alpha_k_iter_vec);
+      // Transformation Jacobian term: log( A / (p(1-p)) ) or -log( (1/A) p(1-p) )
+      // Original code used: store_loglik - std::log(A * previous_p * (1.0 - previous_p))
+      // This suggests store_loglik was log f(x_0) and they subtract log(dp/dx) or add log(dx/dp).
+      // If p = shrink(lambda), then dp/dlambda = (1/A) p (1-p).
+      // So log(dx/dp) = log( A / (p(1-p)) ) = logA - log(p) - log(1-p).
+      // Original code: -log(A) -log(p) -log(1-p). This implies they use f(lambda(p)) * (dlambda/dp).
+      // log(f(lambda(p))) + log(dlambda/dp)
+      // Let's stick to the original formulation's transformed density for slice level.
+      double transformed_log_f_x0 = log_f_x0 - std::log(A * previous_p_val * (1.0 - previous_p_val));
+      slice_level = transformed_log_f_x0 + log(R::unif_rand());
 
-      current_lambda = Lambda(k,t);
-      previous_p = shrink(current_lambda, A);
-      slice_ = store_loglik - std::log(A * previous_p * (1.0 - previous_p))
-              + log(unif_rand()); // <-- using R random uniform
+
+      start_p = val_min; // shrinked value from settings
+      end_p = val_max;   // shrinked value from settings
+
+      // Stepping-out procedure (simplified here, original doesn't show explicit step-out)
+      // The original seems to assume fixed val_min, val_max for p.
 
       for (int shrink_time = 0; shrink_time < max_shrink_time; ++shrink_time) {
-        new_p = sampler::slice_uniform(start, end); // <-- using R function above
-        Lambda(k,t) = expand(new_p, A); // expand
+        new_p_val = sampler::slice_uniform(start_p, end_p); 
+        double proposed_Lambda_kt = expand(new_p_val, A);
         
-        // Update Alpha for this change
-        update_alpha_row_efficient(k);
+        // Efficiently compute alpha_k vector for the proposed_Lambda_kt
+        // Delta is from the original_Lambda_kt for this (k,t) sampling step
+        double delta_lambda = proposed_Lambda_kt - original_Lambda_kt; 
+        VectorXd proposed_alpha_k_vec = alpha_k_topic_base_vec.array() * (C.col(t) * delta_lambda).array().exp(); // O(Ndoc)
 
-        newlambdallk = likelihood_lambda_efficient(k, t);
+        double log_f_proposed = compute_likelihood_terms(k, t, proposed_Lambda_kt, proposed_alpha_k_vec);
+        double transformed_log_f_proposed = log_f_proposed - std::log(A * new_p_val * (1.0 - new_p_val));
 
-        newlikelihood = newlambdallk - std::log(A * new_p * (1.0 - new_p));
-
-        if (slice_ < newlikelihood) {
-          break;
-        } else if (abs(end - start) < 1e-9) {
-          Rcerr << "Shrinked too much. Using a current value." << std::endl;
-          Lambda(k,t) = current_lambda;
-          update_alpha_row_efficient(k);
-          break;
-        } else if (previous_p < new_p) {
-          end = new_p;
-        } else if (new_p < previous_p) {
-          start = new_p;
-        } else {
-          Rcpp::stop("Something goes wrong in sample_lambda_slice(). Adjust `A_slice`.");
+        if (slice_level < transformed_log_f_proposed) { // Accept proposal
+          Lambda(k,t) = proposed_Lambda_kt;
+          // Update the topic's base log_alpha and alpha_vector due to accepted change in Lambda(k,t)
+          log_alpha_k_topic_base += C.col(t) * delta_lambda; 
+          alpha_k_topic_base_vec = log_alpha_k_topic_base.array().exp();
+          break; // Exit shrink_time loop
+        } else { // Shrink interval
+          if (std::abs(end_p - start_p) < 1e-9) {
+            Rcpp::Rcerr << "Slice sampler interval shrunk too much for Lambda(" << k << "," << t 
+                        << "). Keeping current value: " << original_Lambda_kt << std::endl;
+            Lambda(k,t) = original_Lambda_kt; // Keep original value
+            break;
+          }
+          if (previous_p_val < new_p_val) { // Check refers to p_0 vs p_new
+             end_p = new_p_val;
+          } else if (new_p_val < previous_p_val) {
+             start_p = new_p_val;
+          } else {
+            // This case (new_p_val == previous_p_val after failing slice condition)
+            // can happen if interval is tiny or due to precision.
+            // Consider it a shrink failure for this step to avoid infinite loop if interval doesn't change.
+            Rcpp::Rcerr << "Slice sampler new_p equals previous_p for Lambda(" << k << "," << t 
+                        << "). Consider adjusting A_slice or bounds. Keeping current value." << std::endl;
+            Lambda(k,t) = original_Lambda_kt;
+            break;
+          }
         }
-      } // for loop for shrink time
-    } // for loop for num_cov
-  } // for loop for num_topics
+      } // End shrink_time loop
+      // If loop finished without break (e.g. max_shrink_time reached and no accept):
+      // Lambda(k,t) should be original_Lambda_kt. It is, unless current_accepted_Lambda_kt was modified and not reverted.
+      // The logic ensures Lambda(k,t) holds the accepted value or original if none accepted or reverted.
+      // alpha_k_topic_base_vec should also reflect the final accepted Lambda(k,t).
+      // The update to alpha_k_topic_base_vec is done only on acceptance of a *final* value for Lambda(k,t).
+
+    } // End tt loop (covariates)
+
+    // After all t for topic k, Lambda.row(k) is updated. 
+    // Update global Alpha.col(k) and sums using the final alpha_k_topic_base_vec for this topic.
+    for (int d = 0; d < num_doc; ++d) {
+        doc_alpha_sums[d] = doc_alpha_sums[d] - Alpha(d, k) + alpha_k_topic_base_vec(d);
+        doc_alpha_weighted_sums[d] = doc_each_len_weighted[d] + doc_alpha_sums[d];
+        Alpha(d, k) = alpha_k_topic_base_vec(d);
+    }
+  } // End kk loop (topics)
 }
 
 
