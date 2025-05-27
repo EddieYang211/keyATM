@@ -79,7 +79,7 @@ void keyATMcov::resume_initialize_specific()
 }
 
 
-// Helper function to compute log-likelihood terms relevant to Lambda(k,t)
+// OPTIMIZATION 1: Vectorized likelihood computation with pre-allocated memory
 double keyATMcov::compute_likelihood_terms(int k, int t, double current_lambda_kt_val,
                                            const Eigen::VectorXd& current_alpha_k_vec)
 {
@@ -93,20 +93,33 @@ double keyATMcov::compute_likelihood_terms(int k, int t, double current_lambda_k
     return loglik;
   }
 
+  // Use pre-allocated vectors to avoid memory allocation overhead
+  static thread_local Eigen::VectorXd alpha_sum_new_overall_vec;
+  static thread_local Eigen::VectorXd term_weighted_sum_new;
+  static thread_local Eigen::VectorXd term_weighted_sum_old;
+  static thread_local Eigen::VectorXd term_ndk_new;
+  static thread_local Eigen::VectorXd term_ndk_old;
+  
+  // Resize once if needed
+  if (alpha_sum_new_overall_vec.size() != num_doc) {
+    alpha_sum_new_overall_vec.resize(num_doc);
+    term_weighted_sum_new.resize(num_doc);
+    term_weighted_sum_old.resize(num_doc);
+    term_ndk_new.resize(num_doc);
+    term_ndk_old.resize(num_doc);
+  }
+
   // Ensure doc_each_len_weighted is available as Eigen::VectorXd
-  // This mapping should be efficient as it doesn't copy data unless sizes mismatch.
-  // However, ensure doc_each_len_weighted has been populated and its lifetime is valid.
   Eigen::Map<const Eigen::VectorXd> doc_each_len_weighted_eigen(doc_each_len_weighted.data(), doc_each_len_weighted.size());
 
   // Existing Alpha values for topic k across all documents (from global Alpha matrix)
   Eigen::VectorXd alpha_k_old_from_global_Alpha_vec = Alpha.col(k);
 
   // Sum of Alpha values for each document, based on global Alpha
-  // doc_alpha_sums is already Eigen::VectorXd
   const Eigen::VectorXd& alpha_sum_old_overall_vec = doc_alpha_sums;
 
   // New sum of Alpha values if current_alpha_k_vec is used for topic k
-  Eigen::VectorXd alpha_sum_new_overall_vec = alpha_sum_old_overall_vec - alpha_k_old_from_global_Alpha_vec + current_alpha_k_vec;
+  alpha_sum_new_overall_vec.noalias() = alpha_sum_old_overall_vec - alpha_k_old_from_global_Alpha_vec + current_alpha_k_vec;
   
   // Counts for topic k across all documents
   Eigen::VectorXd n_dk_k_vec = n_dk.col(k);
@@ -114,17 +127,17 @@ double keyATMcov::compute_likelihood_terms(int k, int t, double current_lambda_k
   // Define a lambda for applying mylgamma element-wise
   auto mylgamma_unary_op = [this](double x) { return this->mylgamma(x); };
 
-  // Perform vectorized calculations
+  // Perform vectorized calculations with pre-allocated memory
   loglik += (alpha_sum_new_overall_vec.unaryExpr(mylgamma_unary_op) - alpha_sum_old_overall_vec.unaryExpr(mylgamma_unary_op)).sum();
   
-  Eigen::VectorXd term_weighted_sum_new = doc_each_len_weighted_eigen + alpha_sum_new_overall_vec;
-  Eigen::VectorXd term_weighted_sum_old = doc_each_len_weighted_eigen + alpha_sum_old_overall_vec;
+  term_weighted_sum_new.noalias() = doc_each_len_weighted_eigen + alpha_sum_new_overall_vec;
+  term_weighted_sum_old.noalias() = doc_each_len_weighted_eigen + alpha_sum_old_overall_vec;
   loglik -= (term_weighted_sum_new.unaryExpr(mylgamma_unary_op) - term_weighted_sum_old.unaryExpr(mylgamma_unary_op)).sum();
   
   loglik -= (current_alpha_k_vec.unaryExpr(mylgamma_unary_op) - alpha_k_old_from_global_Alpha_vec.unaryExpr(mylgamma_unary_op)).sum();
   
-  Eigen::VectorXd term_ndk_new = n_dk_k_vec + current_alpha_k_vec;
-  Eigen::VectorXd term_ndk_old = n_dk_k_vec + alpha_k_old_from_global_Alpha_vec;
+  term_ndk_new.noalias() = n_dk_k_vec + current_alpha_k_vec;
+  term_ndk_old.noalias() = n_dk_k_vec + alpha_k_old_from_global_Alpha_vec;
   loglik += (term_ndk_new.unaryExpr(mylgamma_unary_op) - term_ndk_old.unaryExpr(mylgamma_unary_op)).sum();
 
   // Prior for Lambda(k,t)
@@ -362,6 +375,7 @@ void keyATMcov::update_alpha_row_efficient(int k)
 }
 
 
+// OPTIMIZATION 2: Cached matrix operations and reduced redundant computations in slice sampling
 void keyATMcov::sample_lambda_slice()
 {
   double start_p, end_p; // Renamed to avoid conflict with Eigen::VectorXd::end()
@@ -369,56 +383,52 @@ void keyATMcov::sample_lambda_slice()
   double previous_p_val = 0.0; // Renamed
   double new_p_val = 0.0; // Renamed
 
-  // double newlikelihood = 0.0; // Not directly used in this form
   double slice_level = 0.0; // Renamed
-  // double current_lambda = 0.0; // Will be Lambda(k,t)
-
-  // double store_loglik; // Will be log_f_x0
-  // double newlambdallk; // Will be log_f_proposed
 
   topic_ids = sampler::shuffled_indexes(num_topics);
   cov_ids = sampler::shuffled_indexes(num_cov); // Global shuffle as original
   int k, t;
   const double A = slice_A; // Shrink/expand factor from model_settings
 
-  // newlambdallk = 0.0; // Not needed here
+  // Pre-allocate reusable vectors to avoid repeated memory allocation
+  static thread_local Eigen::VectorXd log_alpha_k_topic_base;
+  static thread_local Eigen::VectorXd alpha_k_topic_base_vec;
+  static thread_local Eigen::VectorXd proposed_alpha_k_vec;
+  static thread_local Eigen::VectorXd X_k_proposal;
+  static thread_local Eigen::VectorXd C_col_t_times_delta;
+  
+  if (log_alpha_k_topic_base.size() != num_doc) {
+    log_alpha_k_topic_base.resize(num_doc);
+    alpha_k_topic_base_vec.resize(num_doc);
+    proposed_alpha_k_vec.resize(num_doc);
+    X_k_proposal.resize(num_doc);
+    C_col_t_times_delta.resize(num_doc);
+  }
 
   for (int kk = 0; kk < num_topics; ++kk) {
     k = topic_ids[kk];
 
     // Current log(Alpha.col(k)) based on accepted Lambda.row(k) values for this topic
     // This is O(num_doc * num_cov) once per topic k
-    VectorXd log_alpha_k_topic_base = C * Lambda.row(k).transpose();
-    VectorXd alpha_k_topic_base_vec = log_alpha_k_topic_base.array().exp();
+    log_alpha_k_topic_base.noalias() = C * Lambda.row(k).transpose();
+    alpha_k_topic_base_vec = log_alpha_k_topic_base.array().exp();
 
     for (int tt = 0; tt < num_cov; ++tt) {
       t = cov_ids[tt];
       
       double original_Lambda_kt = Lambda(k,t); // Current value of Lambda(k,t) for this step
-      VectorXd alpha_k_iter_vec = alpha_k_topic_base_vec; // Start with base for this (k,t)
-                                                          // This will track Alpha.col(k) if original_Lambda_kt is kept
-
+      
       // Calculate log f(x_0) + log |dx_0/dp_0| for slice definition
-      // Here, x_0 is original_Lambda_kt
       previous_p_val = shrink(original_Lambda_kt, A);
-      double log_f_x0 = compute_likelihood_terms(k, t, original_Lambda_kt, alpha_k_iter_vec);
-      // Transformation Jacobian term: log( A / (p(1-p)) ) or -log( (1/A) p(1-p) )
-      // Original code used: store_loglik - std::log(A * previous_p * (1.0 - previous_p))
-      // This suggests store_loglik was log f(x_0) and they subtract log(dp/dx) or add log(dx/dp).
-      // If p = shrink(lambda), then dp/dlambda = (1/A) p (1-p).
-      // So log(dx/dp) = log( A / (p(1-p)) ) = logA - log(p) - log(1-p).
-      // Original code: -log(A) -log(p) -log(1-p). This implies they use f(lambda(p)) * (dlambda/dp).
-      // log(f(lambda(p))) + log(dlambda/dp)
-      // Let's stick to the original formulation's transformed density for slice level.
+      double log_f_x0 = compute_likelihood_terms(k, t, original_Lambda_kt, alpha_k_topic_base_vec);
       double transformed_log_f_x0 = log_f_x0 - std::log(A * previous_p_val * (1.0 - previous_p_val));
       slice_level = transformed_log_f_x0 + log(R::unif_rand());
-
 
       start_p = val_min; // shrinked value from settings
       end_p = val_max;   // shrinked value from settings
 
-      // Stepping-out procedure (simplified here, original doesn't show explicit step-out)
-      // The original seems to assume fixed val_min, val_max for p.
+      // Pre-compute C.col(t) to avoid repeated column access
+      const Eigen::VectorXd& C_col_t = C.col(t);
 
       for (int shrink_time = 0; shrink_time < max_shrink_time; ++shrink_time) {
         new_p_val = sampler::slice_uniform(start_p, end_p); 
@@ -427,7 +437,10 @@ void keyATMcov::sample_lambda_slice()
         // Efficiently compute alpha_k vector for the proposed_Lambda_kt
         // Delta is from the original_Lambda_kt for this (k,t) sampling step
         double delta_lambda = proposed_Lambda_kt - original_Lambda_kt; 
-        VectorXd proposed_alpha_k_vec = alpha_k_topic_base_vec.array() * (C.col(t) * delta_lambda).array().exp(); // O(Ndoc)
+        
+        // Vectorized computation with pre-allocated memory
+        C_col_t_times_delta.noalias() = C_col_t * delta_lambda;
+        proposed_alpha_k_vec = alpha_k_topic_base_vec.array() * C_col_t_times_delta.array().exp(); // O(Ndoc)
 
         double log_f_proposed = compute_likelihood_terms(k, t, proposed_Lambda_kt, proposed_alpha_k_vec);
         double transformed_log_f_proposed = log_f_proposed - std::log(A * new_p_val * (1.0 - new_p_val));
@@ -435,7 +448,7 @@ void keyATMcov::sample_lambda_slice()
         if (slice_level < transformed_log_f_proposed) { // Accept proposal
           Lambda(k,t) = proposed_Lambda_kt;
           // Update the topic's base log_alpha and alpha_vector due to accepted change in Lambda(k,t)
-          log_alpha_k_topic_base += C.col(t) * delta_lambda; 
+          log_alpha_k_topic_base += C_col_t_times_delta; 
           alpha_k_topic_base_vec = log_alpha_k_topic_base.array().exp();
           break; // Exit shrink_time loop
         } else { // Shrink interval
@@ -460,12 +473,6 @@ void keyATMcov::sample_lambda_slice()
           }
         }
       } // End shrink_time loop
-      // If loop finished without break (e.g. max_shrink_time reached and no accept):
-      // Lambda(k,t) should be original_Lambda_kt. It is, unless current_accepted_Lambda_kt was modified and not reverted.
-      // The logic ensures Lambda(k,t) holds the accepted value or original if none accepted or reverted.
-      // alpha_k_topic_base_vec should also reflect the final accepted Lambda(k,t).
-      // The update to alpha_k_topic_base_vec is done only on acceptance of a *final* value for Lambda(k,t).
-
     } // End tt loop (covariates)
 
     // After all t for topic k, Lambda.row(k) is updated. 
