@@ -1,14 +1,7 @@
 #ifndef __keyATM_cov__INCLUDED__
 #define __keyATM_cov__INCLUDED__
-
-// C++ standard compatibility guards
-#if __cplusplus < 201703L
-#error "This package requires C++17 or later"
-#endif
-
 #define EIGEN_PERMANENTLY_DISABLE_STUPID_WARNINGS
 
-// Include order is important to avoid template conflicts
 #include <Rcpp.h>
 #include <RcppEigen.h>
 #include <unordered_set>
@@ -67,6 +60,11 @@ class keyATMcov : virtual public keyATMmeta
         Eigen::VectorXd term_weighted_sum_old;
         Eigen::VectorXd term_ndk_new;
         Eigen::VectorXd term_ndk_old;
+        Eigen::VectorXd log_alpha_k_topic_base;
+        Eigen::VectorXd alpha_k_topic_base_vec;
+        Eigen::VectorXd proposed_alpha_k_vec;
+        Eigen::VectorXd X_k_proposal;
+        Eigen::VectorXd C_col_t_times_delta;
         
         void resize(int num_doc) {
             if (alpha_sum_new_overall_vec.size() != num_doc) {
@@ -75,6 +73,11 @@ class keyATMcov : virtual public keyATMmeta
                 term_weighted_sum_old.resize(num_doc);
                 term_ndk_new.resize(num_doc);
                 term_ndk_old.resize(num_doc);
+                log_alpha_k_topic_base.resize(num_doc);
+                alpha_k_topic_base_vec.resize(num_doc);
+                proposed_alpha_k_vec.resize(num_doc);
+                X_k_proposal.resize(num_doc);
+                C_col_t_times_delta.resize(num_doc);
             }
         }
     };
@@ -114,7 +117,7 @@ class keyATMcov : virtual public keyATMmeta
                                         const Eigen::VectorXd& current_alpha_k_vec,
                                         ThreadLocalStorage& tls);
     
-    // Main functions
+    // Original functions (modified to use efficient versions)
     void sample_lambda();
     void sample_lambda_mh();
     void sample_lambda_slice();

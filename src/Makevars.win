@@ -1,17 +1,11 @@
-PKG_CXXFLAGS = $(SHLIB_OPENMP_CXXFLAGS) -DHAVE_OPENMP
-PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS)
+PKG_CXXFLAGS = -fopenmp -DHAVE_OPENMP
+PKG_LIBS = -lgomp
 
 # Enable C++17 as required by the package
 CXX_STD = CXX17
 
-# Conservative optimization to avoid template parsing issues
-PKG_CXXFLAGS += -O2 
+# Optimization flags for Windows
+PKG_CXXFLAGS += -O3
 
-# Specific fixes for GCC 12+ template parsing issues
-PKG_CXXFLAGS += -std=c++17 -ftemplate-backtrace-limit=0
-
-# Disable problematic optimizations
-PKG_CXXFLAGS += -fno-strict-aliasing -fno-aggressive-loop-optimizations
-
-# Eigen configuration for stability
-PKG_CXXFLAGS += -DEIGEN_DONT_PARALLELIZE -DEIGEN_NO_DEBUG 
+# Eigen specific flags for better performance
+PKG_CXXFLAGS += -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE -DEIGEN_DONT_PARALLELIZE 
