@@ -8,7 +8,7 @@ CXX_STD = CXX17
 PKG_CXXFLAGS += -ftemplate-backtrace-limit=0 -fconcepts
 
 # Add defines to prevent template parsing conflicts
-PKG_CXXFLAGS += -D__STRICT_ANSI__ -U_GNU_SOURCE
+# PKG_CXXFLAGS += -D__STRICT_ANSI__ -U_GNU_SOURCE
 
 # Optimization flags
 PKG_CXXFLAGS += -O2
