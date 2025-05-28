@@ -44,5 +44,5 @@ Encoding: UTF-8
 BugReports: https://github.com/keyATM/keyATM/issues
 LazyData: TRUE
 RoxygenNote: 7.2.3
-SystemRequirements: C++17
+SystemRequirements: C++17, OpenMP
 Roxygen: list(markdown = TRUE)
