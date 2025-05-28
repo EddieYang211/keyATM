@@ -4,6 +4,8 @@ using namespace Eigen;
 using namespace Rcpp;
 using namespace std;
 
+# define PI_V   3.14159265358979323846  /* pi */
+
 /*
  * KEY OPTIMIZATIONS FOR LARGE DATASETS (>1M rows, ~300 covariates):
  * 
@@ -284,4 +286,133 @@ double keyATMcov::loglik_total()
 void keyATMcov::proposal_lambda(int k)
 {
   // Not used in current implementation
+}
+
+// Missing virtual function implementations required by keyATMcov class
+
+void keyATMcov::read_data_specific()
+{
+  // Read covariate data
+  model_settings = model["model_settings"];
+  NumericMatrix C_r = model_settings["covariates_data_use"];
+  num_cov = C_r.cols();
+  
+  // Convert to Eigen matrix
+  C = Rcpp::as<Eigen::MatrixXd>(C_r);
+  
+  // Read MH parameters
+  mh_use = model_settings["mh_use"];
+  mu = model_settings["mu"];
+  sigma = model_settings["sigma"];
+  
+  // Pre-compute constants for efficiency
+  sigma_squared = sigma * sigma;
+  inv_2sigma_squared = 1.0 / (2.0 * sigma_squared);
+  log_prior_const = -0.5 * log(2.0 * PI_V * sigma_squared);
+  
+  // Slice sampling bounds
+  val_min = model_settings["slice_min"];
+  val_max = model_settings["slice_max"];
+}
+
+void keyATMcov::initialize_specific()
+{
+  // Initialize Lambda matrix
+  Lambda = MatrixXd::Zero(num_topics, num_cov);
+  
+  // Initialize Alpha matrix
+  Alpha = MatrixXd::Zero(num_doc, num_topics);
+  
+  // Pre-allocate working vectors
+  doc_alpha_sums = VectorXd::Zero(num_doc);
+  doc_alpha_weighted_sums = VectorXd::Zero(num_doc);
+  
+  // Initialize Lambda with small random values
+  for (int k = 0; k < num_topics; ++k) {
+    for (int t = 0; t < num_cov; ++t) {
+      Lambda(k, t) = R::rnorm(0.0, 0.1);
+    }
+  }
+  
+  // Compute initial Alpha matrix
+  Alpha = (C * Lambda.transpose()).array().exp();
+}
+
+void keyATMcov::resume_initialize_specific()
+{
+  // Resume from stored Lambda values
+  List Lambda_iter = stored_values["Lambda_iter"];
+  if (Lambda_iter.size() > 0) {
+    NumericMatrix Lambda_R = Lambda_iter[Lambda_iter.size() - 1];
+    Lambda = Rcpp::as<Eigen::MatrixXd>(Lambda_R);
+  }
+  
+  // Pre-allocate working vectors
+  doc_alpha_sums = VectorXd::Zero(num_doc);
+  doc_alpha_weighted_sums = VectorXd::Zero(num_doc);
+  
+  // Recompute Alpha matrix from stored Lambda
+  Alpha = (C * Lambda.transpose()).array().exp();
+}
+
+void keyATMcov::iteration_single(int it)
+{
+  // Single iteration for keyATM covariate model
+  int doc_id_;
+  int doc_length;
+  int w_, z_, s_;
+  int new_z, new_s;
+  int w_position;
+
+  doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
+
+  for (int ii = 0; ii < num_doc; ++ii) {
+    doc_id_ = doc_indexes[ii];
+    doc_s = S[doc_id_], doc_z = Z[doc_id_], doc_w = W[doc_id_];
+    doc_length = doc_each_len[doc_id_];
+
+    token_indexes = sampler::shuffled_indexes(doc_length); //shuffle
+
+    // Get document-specific alpha from Alpha matrix
+    VectorXd doc_alpha = Alpha.row(doc_id_).transpose();
+
+    // Iterate each word in the document
+    for (int jj = 0; jj < doc_length; ++jj) {
+      w_position = token_indexes[jj];
+      s_ = doc_s[w_position], z_ = doc_z[w_position], w_ = doc_w[w_position];
+
+      new_z = sample_z(doc_alpha, z_, s_, w_, doc_id_);
+      doc_z[w_position] = new_z;
+
+      if (keywords[new_z].find(w_) == keywords[new_z].end())
+        continue;
+
+      z_ = doc_z[w_position]; // use updated z
+      new_s = sample_s(z_, s_, w_, doc_id_);
+      doc_s[w_position] = new_s;
+    }
+
+    Z[doc_id_] = doc_z;
+    S[doc_id_] = doc_s;
+  }
+  
+  sample_parameters(it);
+}
+
+void keyATMcov::sample_parameters(int it)
+{
+  // Sample Lambda parameters
+  sample_lambda();
+  
+  // Update Alpha matrix after Lambda sampling
+  Alpha = (C * Lambda.transpose()).array().exp();
+  
+  // Store Lambda values
+  int r_index = it + 1;
+  if (r_index % thinning == 0 || r_index == 1 || r_index == iter) {
+    NumericMatrix Lambda_R = Rcpp::wrap(Lambda);
+    List Lambda_iter = stored_values["Lambda_iter"];
+    Lambda_iter.push_back(Lambda_R);
+    stored_values["Lambda_iter"] = Lambda_iter;
+  }
 }
