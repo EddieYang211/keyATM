@@ -4,8 +4,11 @@ PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS)
 # Enable C++17 as required by the package
 CXX_STD = CXX17
 
-# Optimization flags (removed architecture-specific flags for compatibility)
-PKG_CXXFLAGS += -O3
+# Optimization flags with conservative settings for compatibility
+PKG_CXXFLAGS += -O2 -fno-strict-aliasing
 
-# Eigen specific flags for better performance
-PKG_CXXFLAGS += -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE -DEIGEN_DONT_PARALLELIZE 
+# Fix for template parsing issues with newer GCC versions
+PKG_CXXFLAGS += -fpermissive -Wno-deprecated-declarations
+
+# Eigen specific flags for better performance (removed problematic flags)
+PKG_CXXFLAGS += -DEIGEN_DONT_PARALLELIZE 

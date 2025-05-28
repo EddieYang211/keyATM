@@ -1,7 +1,14 @@
 #ifndef __keyATM_cov__INCLUDED__
 #define __keyATM_cov__INCLUDED__
+
+// C++ standard compatibility guards
+#if __cplusplus < 201703L
+#error "This package requires C++17 or later"
+#endif
+
 #define EIGEN_PERMANENTLY_DISABLE_STUPID_WARNINGS
 
+// Include order is important to avoid template conflicts
 #include <Rcpp.h>
 #include <RcppEigen.h>
 #include <unordered_set>
