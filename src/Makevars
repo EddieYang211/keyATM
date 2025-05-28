@@ -1,0 +1,11 @@
+PKG_CXXFLAGS = $(SHLIB_OPENMP_CXXFLAGS) -DHAVE_OPENMP
+PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS)
+
+# Enable C++17 as required by the package
+CXX_STD = CXX17
+
+# Optimization flags
+PKG_CXXFLAGS += -O3 -march=native -mtune=native
+
+# Eigen specific flags for better performance
+PKG_CXXFLAGS += -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE -DEIGEN_DONT_PARALLELIZE 

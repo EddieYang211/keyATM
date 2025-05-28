@@ -1,0 +1,11 @@
+PKG_CXXFLAGS = -fopenmp -DHAVE_OPENMP
+PKG_LIBS = -lgomp
+
+# Enable C++17 as required by the package
+CXX_STD = CXX17
+
+# Optimization flags for Windows
+PKG_CXXFLAGS += -O3
+
+# Eigen specific flags for better performance
+PKG_CXXFLAGS += -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE -DEIGEN_DONT_PARALLELIZE 
