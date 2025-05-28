@@ -699,11 +699,19 @@ check_arg_model_settings <- function(obj, model, info)
       obj$PG_params$theta_last <- matrix(rep(0, D*K), nrow = D, ncol = K)
       obj$PG_params$Lambda_list <- list()
       obj$PG_params$Sigma_list <- list()
+    } else if (obj$covariates_model == "DirMulti") {
+      # Set default prior parameters for DirMulti model
+      if (is.null(obj$mu)) {
+        obj$mu <- 0.0
+      }
+      if (is.null(obj$sigma)) {
+        obj$sigma <- 1.0
+      }
     }
 
     allowed_arguments <- c(allowed_arguments, "covariates_data", "covariates_data_use",
                            "slice_min", "slice_max", "mh_use", "covariates_model", "PG_params",
-                           "covariates_formula", "standardize", "info")
+                           "covariates_formula", "standardize", "info", "mu", "sigma")
   }  # cov model end
 
   # check model settings for dynamic model
