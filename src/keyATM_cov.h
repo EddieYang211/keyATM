@@ -131,6 +131,10 @@ class keyATMcov : virtual public keyATMmeta
     // Helper function for likelihood computation
     double compute_likelihood_terms(int k, int t, double current_lambda_kt_val,
                                     const Eigen::VectorXd& current_alpha_k_vec);
+    
+    // Optimized likelihood computation for MH sampling
+    double compute_likelihood_efficient(int k, int t, double lambda_kt_val,
+                                        const Eigen::VectorXd& alpha_k_vec);
 };
 
 
