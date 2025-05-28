@@ -1,3 +1,8 @@
+// C++ standard compatibility guards
+#if __cplusplus < 201703L
+#error "This package requires C++17 or later"
+#endif
+
 #include "keyATM_cov.h"
 
 using namespace Eigen;
