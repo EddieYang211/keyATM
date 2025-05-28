@@ -60,11 +60,6 @@ class keyATMcov : virtual public keyATMmeta
         Eigen::VectorXd term_weighted_sum_old;
         Eigen::VectorXd term_ndk_new;
         Eigen::VectorXd term_ndk_old;
-        Eigen::VectorXd log_alpha_k_topic_base;
-        Eigen::VectorXd alpha_k_topic_base_vec;
-        Eigen::VectorXd proposed_alpha_k_vec;
-        Eigen::VectorXd X_k_proposal;
-        Eigen::VectorXd C_col_t_times_delta;
         
         void resize(int num_doc) {
             if (alpha_sum_new_overall_vec.size() != num_doc) {
@@ -73,11 +68,6 @@ class keyATMcov : virtual public keyATMmeta
                 term_weighted_sum_old.resize(num_doc);
                 term_ndk_new.resize(num_doc);
                 term_ndk_old.resize(num_doc);
-                log_alpha_k_topic_base.resize(num_doc);
-                alpha_k_topic_base_vec.resize(num_doc);
-                proposed_alpha_k_vec.resize(num_doc);
-                X_k_proposal.resize(num_doc);
-                C_col_t_times_delta.resize(num_doc);
             }
         }
     };
@@ -117,7 +107,7 @@ class keyATMcov : virtual public keyATMmeta
                                         const Eigen::VectorXd& current_alpha_k_vec,
                                         ThreadLocalStorage& tls);
     
-    // Original functions (modified to use efficient versions)
+    // Main functions
     void sample_lambda();
     void sample_lambda_mh();
     void sample_lambda_slice();
