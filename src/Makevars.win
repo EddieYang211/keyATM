@@ -4,6 +4,12 @@ PKG_LIBS = -lgomp
 # Enable C++17 as required by the package
 CXX_STD = CXX17
 
+# Add compatibility flags for template parsing issues
+PKG_CXXFLAGS += -ftemplate-backtrace-limit=0 -fconcepts
+
+# Add defines to prevent template parsing conflicts
+PKG_CXXFLAGS += -D__STRICT_ANSI__ -U_GNU_SOURCE
+
 # Optimization flags for Windows
 PKG_CXXFLAGS += -O3
 
