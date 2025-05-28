@@ -1,5 +1,5 @@
-PKG_CXXFLAGS = -fopenmp -DHAVE_OPENMP
-PKG_LIBS = -lgomp
+PKG_CXXFLAGS = $(SHLIB_OPENMP_CXXFLAGS) -DHAVE_OPENMP
+PKG_LIBS = $(SHLIB_OPENMP_CXXFLAGS)
 
 # Enable C++17 as required by the package
 CXX_STD = CXX17
@@ -11,7 +11,7 @@ PKG_CXXFLAGS += -ftemplate-backtrace-limit=0 -fconcepts
 PKG_CXXFLAGS += -D__STRICT_ANSI__ -U_GNU_SOURCE
 
 # Optimization flags for Windows
-PKG_CXXFLAGS += -O3
+PKG_CXXFLAGS += -O2
 
 # Eigen specific flags for better performance
 PKG_CXXFLAGS += -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE -DEIGEN_DONT_PARALLELIZE 

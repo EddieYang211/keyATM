@@ -11,7 +11,7 @@ PKG_CXXFLAGS += -ftemplate-backtrace-limit=0 -fconcepts
 PKG_CXXFLAGS += -D__STRICT_ANSI__ -U_GNU_SOURCE
 
 # Optimization flags
-PKG_CXXFLAGS += -O3 -march=native -mtune=native
+PKG_CXXFLAGS += -O2
 
 # Eigen specific flags for better performance
 PKG_CXXFLAGS += -DEIGEN_USE_BLAS -DEIGEN_USE_LAPACKE -DEIGEN_DONT_PARALLELIZE 
