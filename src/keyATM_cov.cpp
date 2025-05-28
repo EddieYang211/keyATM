@@ -5,6 +5,10 @@
 #include <omp.h>
 #endif
 
+// Additional includes for safer parallel implementation
+#include <ctime>
+#include <stdexcept>
+
 using namespace Eigen;
 using namespace Rcpp;
 using namespace std;
@@ -15,16 +19,35 @@ using namespace std;
 void keyATMcov::setup_openmp()
 {
 #ifdef _OPENMP
-    // Get number of available threads, but be very conservative for stability
-    num_threads = std::min(omp_get_max_threads(), 4); // Cap at 4 threads for safety
-    // For very large datasets, still limit threads to prevent memory exhaustion
-    if (num_doc > 500000) {
-        num_threads = std::min(num_threads, 2); // Even more conservative for huge datasets
+    // Be very conservative with thread count for safety
+    int max_threads = omp_get_max_threads();
+    
+    // Start with conservative threading based on dataset size
+    if (num_doc < 10000) {
+        num_threads = 1; // Single thread for small datasets
+    } else if (num_doc < 100000) {
+        num_threads = std::min(max_threads, 2); // Max 2 threads for medium datasets
+    } else if (num_doc < 500000) {
+        num_threads = std::min(max_threads, 3); // Max 3 threads for large datasets
+    } else {
+        num_threads = std::min(max_threads, 4); // Max 4 threads for very large datasets
     }
-    use_openmp = true;
+    
+    // Additional checks for memory-intensive operations
+    if (num_cov > 100) {
+        num_threads = std::min(num_threads, 4); // Reduce threads for high-dimensional problems
+    }
+    
+    use_openmp = (num_threads > 1);
     
     if (verbose) {
-        Rcpp::Rcout << "Using OpenMP with " << num_threads << " threads for optimization." << std::endl;
+        if (use_openmp) {
+            Rcpp::Rcout << "Using OpenMP with " << num_threads << " threads for optimization." << std::endl;
+            Rcpp::Rcout << "Dataset size: " << num_doc << " documents, " << num_cov << " covariates, " 
+                        << num_topics << " topics." << std::endl;
+        } else {
+            Rcpp::Rcout << "Using single-threaded computation (dataset size: " << num_doc << " docs)." << std::endl;
+        }
     }
 #else
     num_threads = 1;
@@ -39,9 +62,24 @@ void keyATMcov::setup_openmp()
 void keyATMcov::init_thread_storage()
 {
     thread_storage.clear();
-    thread_storage.resize(num_threads);
-    for (int t = 0; t < num_threads; ++t) {
-        try {
+    
+    if (!use_openmp || num_threads <= 1) {
+        return; // No need to initialize thread storage for single-threaded execution
+    }
+    
+    try {
+        thread_storage.reserve(num_threads);
+        thread_storage.resize(num_threads);
+        
+        for (int t = 0; t < num_threads; ++t) {
+            // Check memory availability before allocating large vectors
+            if (num_doc > 1000000) {
+                size_t estimated_memory = num_doc * 10 * sizeof(double); // Rough estimate
+                if (verbose) {
+                    Rcpp::Rcout << "Estimated memory per thread: " << (estimated_memory / 1024 / 1024) << " MB" << std::endl;
+                }
+            }
+            
             thread_storage[t].alpha_sum_new_overall_vec.resize(num_doc);
             thread_storage[t].term_weighted_sum_new.resize(num_doc);
             thread_storage[t].term_weighted_sum_old.resize(num_doc);
@@ -53,14 +91,37 @@ void keyATMcov::init_thread_storage()
             thread_storage[t].X_k_proposal.resize(num_doc);
             thread_storage[t].C_col_t_times_delta.resize(num_doc);
             
-            // Initialize thread-specific RNG with unique seed
-            thread_storage[t].rng.seed(std::random_device{}() + t * 12345);
-        } catch (const std::exception& e) {
-            Rcpp::Rcerr << "Error initializing thread storage for thread " << t << ": " << e.what() << std::endl;
-            use_openmp = false;
-            num_threads = 1;
-            return;
+            // Initialize thread-specific RNG with high-quality seed
+            std::random_device rd;
+            thread_storage[t].rng.seed(rd() + t * 98765 + static_cast<unsigned>(std::time(nullptr)));
+            
+            // Test the RNG to make sure it's working
+            double test_val = thread_storage[t].unif_dist(thread_storage[t].rng);
+            if (test_val < 0.0 || test_val > 1.0) {
+                throw std::runtime_error("RNG initialization failed for thread " + std::to_string(t));
+            }
         }
+        
+        if (verbose) {
+            Rcpp::Rcout << "Successfully initialized thread-local storage for " << num_threads << " threads." << std::endl;
+        }
+        
+    } catch (const std::exception& e) {
+        Rcpp::Rcerr << "Error initializing thread storage: " << e.what() << std::endl;
+        Rcpp::Rcerr << "Falling back to single-threaded execution." << std::endl;
+        
+        // Clean up any partially initialized storage
+        thread_storage.clear();
+        use_openmp = false;
+        num_threads = 1;
+        
+        // Try to free memory
+        std::vector<ThreadLocalStorage>().swap(thread_storage);
+    } catch (...) {
+        Rcpp::Rcerr << "Unknown error during thread storage initialization. Using single-threaded execution." << std::endl;
+        thread_storage.clear();
+        use_openmp = false;
+        num_threads = 1;
     }
 }
 
@@ -291,11 +352,12 @@ void keyATMcov::iteration_single(int it)
 
   doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
 
-  // Create Alpha for this iteration - vectorized computation
+  // Create Alpha for this iteration - vectorized computation with safe parallelization
   update_alpha_efficient();
 
-  // For now, disable document-level parallelization due to RNG thread safety issues
-  // TODO: Implement proper thread-safe sampling for documents
+  // Document-level sampling remains sequential for thread safety
+  // The R sampling functions (sample_z, sample_s) are not thread-safe
+  // Future optimization: implement thread-safe sampling functions
   for (int ii = 0; ii < num_doc; ++ii) {
     doc_id_ = doc_indexes[ii];
     doc_s = S[doc_id_], doc_z = Z[doc_id_], doc_w = W[doc_id_];
@@ -324,6 +386,12 @@ void keyATMcov::iteration_single(int it)
 
     Z[doc_id_] = doc_z;
     S[doc_id_] = doc_s;
+    
+    // Progress indicator for long iterations
+    if (verbose && num_doc > 50000 && ii % (num_doc / 10) == 0) {
+      Rcpp::Rcout << "  Processed " << ii << "/" << num_doc << " documents (" 
+                  << (100 * ii / num_doc) << "%)" << std::endl;
+    }
   }
   
   sample_parameters(it);
@@ -333,43 +401,134 @@ void keyATMcov::iteration_single(int it)
 void keyATMcov::update_alpha_efficient()
 {
   // Vectorized computation: Alpha = exp(C * Lambda^T)
+  // This matrix operation is thread-safe when done as a single operation
   Alpha = (C * Lambda.transpose()).array().exp();
   
-  // Pre-compute sums for likelihood computation
-  if (num_doc > 0 && Alpha.rows() == num_doc && Alpha.cols() == num_topics) { // Check dimensions
-    doc_alpha_sums = Alpha.rowwise().sum(); // Should now work with Eigen::VectorXd
-    if (doc_each_len_weighted.size() == num_doc && doc_alpha_sums.size() == num_doc) {
-        // Assuming doc_each_len_weighted is std::vector<double>
-        Eigen::VectorXd doc_each_len_weighted_eigen = Eigen::Map<const Eigen::VectorXd>(doc_each_len_weighted.data(), doc_each_len_weighted.size());
-        doc_alpha_weighted_sums = doc_each_len_weighted_eigen.array() + doc_alpha_sums.array(); // Should now work
-    } else {
-        // Handle size mismatch, perhaps by re-initializing or erroring
-        if (doc_each_len_weighted.size() != num_doc) {
-             Rcpp::Rcerr << "Dimension mismatch: doc_each_len_weighted.size() (" << doc_each_len_weighted.size() 
-                         << ") != num_doc (" << num_doc << ")" << std::endl;
-        }
-        if (doc_alpha_sums.size() != num_doc) {
-            Rcpp::Rcerr << "Dimension mismatch: doc_alpha_sums.size() (" << doc_alpha_sums.size() 
-                        << ") != num_doc (" << num_doc << ")" << std::endl;
-        }
-        // Fallback or error, ensure vectors are correctly sized if proceeding
-        // For safety, one might re-initialize or use the loop if checks fail,
-        // or throw an error. If doc_each_len_weighted is std::vector, conversion is needed.
-        // For now, assuming it's compatible for direct Eigen operations.
-    }
-  } else { // Fallback to loop if num_doc is 0 or Alpha dimensions are unexpected
-      // If using Eigen::VectorXd, direct assignment from sum is better than loop
-      // This manual loop would be inefficient if sizes are large and types are Eigen.
-      // However, if the intention is a safe fallback for small/problematic cases:
-      if (num_doc > 0) { // Guard against num_doc = 0 for Alpha.row(d)
+  // Pre-compute sums for likelihood computation with safe parallelization
+  if (num_doc > 0 && Alpha.rows() == num_doc && Alpha.cols() == num_topics) {
+    
+#ifdef _OPENMP
+    if (use_openmp && num_doc > 5000) {
+      // Parallel computation of row sums
+      #pragma omp parallel for num_threads(num_threads) schedule(static)
+      for (int d = 0; d < num_doc; ++d) {
+        doc_alpha_sums(d) = Alpha.row(d).sum();
+      }
+      
+      // Parallel computation of weighted sums
+      if (doc_each_len_weighted.size() == num_doc) {
+        #pragma omp parallel for num_threads(num_threads) schedule(static)
         for (int d = 0; d < num_doc; ++d) {
-          if (d < doc_alpha_sums.size()) doc_alpha_sums(d) = Alpha.row(d).sum();
+          doc_alpha_weighted_sums(d) = doc_each_len_weighted[d] + doc_alpha_sums(d);
+        }
+      } else {
+        // Fallback to sequential if size mismatch
+        if (verbose) {
+          Rcpp::Rcerr << "Dimension mismatch in update_alpha_efficient, using sequential computation" << std::endl;
+        }
+        for (int d = 0; d < num_doc; ++d) {
+          if (d < doc_alpha_weighted_sums.size() && d < doc_each_len_weighted.size() && d < doc_alpha_sums.size()) {
+             doc_alpha_weighted_sums(d) = doc_each_len_weighted[d] + doc_alpha_sums(d);
+          }
+        }
+      }
+    } else {
+#endif
+      // Sequential computation for smaller datasets or when OpenMP unavailable
+      doc_alpha_sums = Alpha.rowwise().sum();
+      if (doc_each_len_weighted.size() == num_doc && doc_alpha_sums.size() == num_doc) {
+          Eigen::VectorXd doc_each_len_weighted_eigen = Eigen::Map<const Eigen::VectorXd>(doc_each_len_weighted.data(), doc_each_len_weighted.size());
+          doc_alpha_weighted_sums = doc_each_len_weighted_eigen.array() + doc_alpha_sums.array();
+      } else {
+          // Handle size mismatch safely
+          if (doc_each_len_weighted.size() != num_doc) {
+               Rcpp::Rcerr << "Dimension mismatch: doc_each_len_weighted.size() (" << doc_each_len_weighted.size() 
+                           << ") != num_doc (" << num_doc << ")" << std::endl;
+          }
+          if (doc_alpha_sums.size() != num_doc) {
+              Rcpp::Rcerr << "Dimension mismatch: doc_alpha_sums.size() (" << doc_alpha_sums.size() 
+                          << ") != num_doc (" << num_doc << ")" << std::endl;
+          }
+      }
+#ifdef _OPENMP
+    }
+#endif
+    
+  } else { // Fallback to loop if dimensions are unexpected
+      if (num_doc > 0 && Alpha.rows() > 0 && Alpha.cols() > 0) {
+        // Safe fallback with bounds checking
+        int max_docs = std::min(num_doc, (int)Alpha.rows());
+        for (int d = 0; d < max_docs; ++d) {
+          if (d < doc_alpha_sums.size()) {
+            doc_alpha_sums(d) = Alpha.row(d).sum();
+          }
           if (d < doc_alpha_weighted_sums.size() && d < doc_each_len_weighted.size() && d < doc_alpha_sums.size()) {
              doc_alpha_weighted_sums(d) = doc_each_len_weighted[d] + doc_alpha_sums(d);
           }
         }
       }
   }
+}
+
+
+void keyATMcov::update_alpha_row_efficient(int k)
+{
+  // Bounds checking
+  if (k < 0 || k >= num_topics || k >= Lambda.rows()) {
+    Rcpp::Rcerr << "Invalid topic index in update_alpha_row_efficient: " << k << std::endl;
+    return;
+  }
+  
+  // Update only row k of Alpha after Lambda(k, :) changes
+  VectorXd lambda_k = Lambda.row(k).transpose();
+  VectorXd new_alpha_k_col = (C * lambda_k).array().exp();
+  
+  // Bounds checking for new_alpha_k_col
+  if (new_alpha_k_col.size() != num_doc) {
+    Rcpp::Rcerr << "Size mismatch in update_alpha_row_efficient" << std::endl;
+    return;
+  }
+  
+#ifdef _OPENMP
+  if (use_openmp && num_doc > 10000) {
+    // Parallel update with atomic operations for shared data
+    #pragma omp parallel for num_threads(num_threads) schedule(static)
+    for (int d = 0; d < num_doc; ++d) {
+      if (d < Alpha.rows() && k < Alpha.cols()) {
+        double old_alpha_dk = Alpha(d, k);
+        double new_alpha_dk = new_alpha_k_col(d);
+        
+        // Update Alpha matrix
+        Alpha(d, k) = new_alpha_dk;
+        
+        // Thread-safe updates of sums
+        if (d < doc_alpha_sums.size()) {
+          #pragma omp atomic
+          doc_alpha_sums(d) += (new_alpha_dk - old_alpha_dk);
+        }
+        
+        // Update weighted sums (can be done without atomic since it's per-thread)
+        if (d < doc_alpha_weighted_sums.size() && d < doc_each_len_weighted.size()) {
+          doc_alpha_weighted_sums(d) = doc_each_len_weighted[d] + doc_alpha_sums(d);
+        }
+      }
+    }
+  } else {
+#endif
+    // Sequential version for smaller datasets
+    for (int d = 0; d < num_doc; ++d) {
+      if (d < Alpha.rows() && k < Alpha.cols() && d < doc_alpha_sums.size()) {
+        doc_alpha_sums(d) = doc_alpha_sums(d) - Alpha(d, k) + new_alpha_k_col(d);
+        Alpha(d, k) = new_alpha_k_col(d);
+        
+        if (d < doc_alpha_weighted_sums.size() && d < doc_each_len_weighted.size()) {
+          doc_alpha_weighted_sums(d) = doc_each_len_weighted[d] + doc_alpha_sums(d);
+        }
+      }
+    }
+#ifdef _OPENMP
+  }
+#endif
 }
 
 
@@ -418,218 +577,213 @@ double keyATMcov::likelihood_lambda(int k, int t)
 
 void keyATMcov::sample_lambda()
 {
-  // For now, disable parallelization of lambda sampling due to thread safety issues
-  // Use the original efficient sequential versions
-  mh_use ? sample_lambda_mh_efficient() : sample_lambda_slice();
+  // Start with safer parallelization - only for likelihood computation heavy operations
+#ifdef _OPENMP
+  if (use_openmp && (num_topics > 5 && num_cov > 20)) {
+    // Use parallel versions only for larger problems where it's worth the overhead
+    mh_use ? sample_lambda_mh_parallel() : sample_lambda_slice_parallel();
+  } else {
+#endif
+    mh_use ? sample_lambda_mh_efficient() : sample_lambda_slice();
+#ifdef _OPENMP
+  }
+#endif
 }
 
 
 void keyATMcov::sample_lambda_mh_parallel()
 {
-  // DISABLED FOR NOW - thread safety issues with RNG
-  // Fallback to sequential version
-  sample_lambda_mh_efficient();
-}
+#ifdef _OPENMP
+  if (!use_openmp || thread_storage.size() == 0) {
+    sample_lambda_mh_efficient();
+    return;
+  }
 
-
-void keyATMcov::sample_lambda_slice_parallel()
-{
-  // DISABLED FOR NOW - thread safety issues with RNG  
-  // Fallback to sequential version
-  sample_lambda_slice();
-}
-
-
-void keyATMcov::sample_lambda_mh_efficient()
-{
-  std::vector<double> adapter_step(num_cov, 0.1); // adaptive step
+  std::vector<double> adapter_step(num_cov, 0.1);
   std::vector<std::vector<bool>> accept_flags(num_topics, std::vector<bool>(num_cov, false));
   std::vector<std::vector<double>> mh_step_size = model_settings["mh_step_size"];
 
   topic_ids = sampler::shuffled_indexes(num_topics);
   cov_ids = sampler::shuffled_indexes(num_cov);
 
+  // Process topics in parallel, but with careful synchronization
+  #pragma omp parallel for schedule(dynamic, 1) num_threads(num_threads) shared(accept_flags)
   for (int k_idx = 0; k_idx < num_topics; ++k_idx) {
     int k = topic_ids[k_idx];
-
-    // Calculate X_k = C * Lambda.row(k).transpose() based on the state of Lambda.row(k)
-    // at the start of sampling covariates for this topic k.
-    Eigen::VectorXd current_X_k = C * Lambda.row(k).transpose(); // num_doc x 1
+    int thread_id = omp_get_thread_num();
+    
+    // Ensure thread_id is valid
+    if (thread_id >= thread_storage.size()) continue;
+    
+    ThreadLocalStorage& tls = thread_storage[thread_id];
+    
+    // Read Lambda.row(k) once at the start (read-only, thread-safe)
+    Eigen::VectorXd current_lambda_k_row;
+    #pragma omp critical(lambda_read)
+    {
+      current_lambda_k_row = Lambda.row(k).transpose();
+    }
+    
+    Eigen::VectorXd current_X_k = C * current_lambda_k_row;
 
     for (int t_idx = 0; t_idx < num_cov; ++t_idx) {
       int t = cov_ids[t_idx];
-      double lambda_kt_current = Lambda(k,t);
+      double lambda_kt_current = current_lambda_k_row(t);
 
       // Alpha vector for current Lambda(k,t) using the current_X_k state
-      // current_X_k reflects all accepted Lambda(k,t') up to t-1 for this topic k, and original Lambda(k,t)
-      Eigen::VectorXd alpha_for_current_L = current_X_k.array().exp();
-      double current_L = likelihood_lambda_efficient(k, t, &alpha_for_current_L);
+      tls.alpha_k_topic_base_vec = current_X_k.array().exp();
+      double current_L = compute_likelihood_terms_threadlocal(k, t, lambda_kt_current, 
+                                                            tls.alpha_k_topic_base_vec, tls);
 
-      // Proposal
+      // Proposal using thread-safe RNG
       double U_var = mh_step_size[k][t];
-      double step = R::rnorm(0.0, U_var);
+      double step = tls.norm_dist(tls.rng) * U_var;
       double lambda_kt_new = lambda_kt_current + step;
 
-      // Calculate the new X_k for the proposal: X_k_proposal = current_X_k + C.col(t) * step
-      Eigen::VectorXd X_k_proposal = current_X_k + C.col(t) * step;
-      Eigen::VectorXd alpha_for_new_L = X_k_proposal.array().exp();
+      // Calculate the new X_k for the proposal
+      tls.X_k_proposal = current_X_k + C.col(t) * step;
+      tls.proposed_alpha_k_vec = tls.X_k_proposal.array().exp();
 
-      // Temporarily update Lambda(k,t) so that likelihood_lambda_efficient uses the new value if it reads Lambda(k,t) globally
-      Lambda(k,t) = lambda_kt_new; 
-      double new_L = likelihood_lambda_efficient(k, t, &alpha_for_new_L);
+      // Calculate new likelihood with thread-local storage
+      double new_L = compute_likelihood_terms_threadlocal(k, t, lambda_kt_new, 
+                                                         tls.proposed_alpha_k_vec, tls);
 
-      // Acceptance calculation (symmetric proposal, so prior ratio for proposal is 1)
+      // Acceptance calculation
       double log_acceptance_ratio = new_L - current_L;
       
-      if (log(R::runif(0.0, 1.0)) < log_acceptance_ratio) {
-        // Accept: Lambda(k,t) is already lambda_kt_new
+      if (std::log(tls.unif_dist(tls.rng)) < log_acceptance_ratio) {
+        // Accept: update Lambda(k,t) in a thread-safe way
+        #pragma omp critical(lambda_update)
+        {
+          Lambda(k,t) = lambda_kt_new;
+        }
         accept_flags[k][t] = true;
-        current_X_k = X_k_proposal; // Update the base X_k for the next covariate t' in this topic k
-      } else {
-        // Reject: revert Lambda(k,t)
-        Lambda(k,t) = lambda_kt_current;
-        // current_X_k remains unchanged (based on previously accepted lambda_kt_current)
+        current_X_k = tls.X_k_proposal; // Update local X_k
+        current_lambda_k_row(t) = lambda_kt_new; // Update local copy
       }
+      // If rejected, no updates needed
     }
   }
 
   // Store acceptance rates
   model_settings["accept_Lambda"] = accept_flags;
-}
-
-
-void keyATMcov::sample_lambda_mh()
-{
-  // Use the efficient version
+#else
   sample_lambda_mh_efficient();
+#endif
 }
 
 
-void keyATMcov::update_alpha_row_efficient(int k)
+void keyATMcov::sample_lambda_slice_parallel()
 {
-  // Update only row k of Alpha after Lambda(k, :) changes
-  VectorXd lambda_k = Lambda.row(k).transpose();
-  VectorXd new_alpha_k_col = (C * lambda_k).array().exp(); // This is Alpha.col(k)
-  
-  // Sequential version - no parallelization for stability
-  for (int d = 0; d < num_doc; ++d) {
-    doc_alpha_sums(d) = doc_alpha_sums(d) - Alpha(d, k) + new_alpha_k_col(d);
-    doc_alpha_weighted_sums(d) = doc_each_len_weighted[d] + doc_alpha_sums(d);
-    Alpha(d, k) = new_alpha_k_col(d);
+#ifdef _OPENMP
+  if (!use_openmp || thread_storage.size() == 0) {
+    sample_lambda_slice();
+    return;
   }
-}
-
-
-// OPTIMIZATION 2: Cached matrix operations and reduced redundant computations in slice sampling
-void keyATMcov::sample_lambda_slice()
-{
-  double start_p, end_p; // Renamed to avoid conflict with Eigen::VectorXd::end()
-
-  double previous_p_val = 0.0; // Renamed
-  double new_p_val = 0.0; // Renamed
-
-  double slice_level = 0.0; // Renamed
 
   topic_ids = sampler::shuffled_indexes(num_topics);
-  cov_ids = sampler::shuffled_indexes(num_cov); // Global shuffle as original
-  int k, t;
-  const double A = slice_A; // Shrink/expand factor from model_settings
+  cov_ids = sampler::shuffled_indexes(num_cov);
+  const double A = slice_A;
 
-  // Pre-allocate reusable vectors to avoid repeated memory allocation
-  static thread_local Eigen::VectorXd log_alpha_k_topic_base;
-  static thread_local Eigen::VectorXd alpha_k_topic_base_vec;
-  static thread_local Eigen::VectorXd proposed_alpha_k_vec;
-  static thread_local Eigen::VectorXd X_k_proposal;
-  static thread_local Eigen::VectorXd C_col_t_times_delta;
-  
-  if (log_alpha_k_topic_base.size() != num_doc) {
-    log_alpha_k_topic_base.resize(num_doc);
-    alpha_k_topic_base_vec.resize(num_doc);
-    proposed_alpha_k_vec.resize(num_doc);
-    X_k_proposal.resize(num_doc);
-    C_col_t_times_delta.resize(num_doc);
-  }
-
+  // Process topics in parallel with careful synchronization
+  #pragma omp parallel for schedule(dynamic, 1) num_threads(num_threads)
   for (int kk = 0; kk < num_topics; ++kk) {
-    k = topic_ids[kk];
+    int k = topic_ids[kk];
+    int thread_id = omp_get_thread_num();
+    
+    if (thread_id >= thread_storage.size()) continue;
+    
+    ThreadLocalStorage& tls = thread_storage[thread_id];
 
+    // Read current Lambda.row(k) in thread-safe manner
+    Eigen::VectorXd current_lambda_k_row;
+    #pragma omp critical(lambda_read)
+    {
+      current_lambda_k_row = Lambda.row(k).transpose();
+    }
+    
     // Current log(Alpha.col(k)) based on accepted Lambda.row(k) values for this topic
-    // This is O(num_doc * num_cov) once per topic k
-    log_alpha_k_topic_base.noalias() = C * Lambda.row(k).transpose();
-    alpha_k_topic_base_vec = log_alpha_k_topic_base.array().exp();
+    tls.log_alpha_k_topic_base.noalias() = C * current_lambda_k_row;
+    tls.alpha_k_topic_base_vec = tls.log_alpha_k_topic_base.array().exp();
 
     for (int tt = 0; tt < num_cov; ++tt) {
-      t = cov_ids[tt];
+      int t = cov_ids[tt];
       
-      double original_Lambda_kt = Lambda(k,t); // Current value of Lambda(k,t) for this step
+      double original_Lambda_kt = current_lambda_k_row(t);
       
       // Calculate log f(x_0) + log |dx_0/dp_0| for slice definition
-      previous_p_val = shrink(original_Lambda_kt, A);
-      double log_f_x0 = compute_likelihood_terms(k, t, original_Lambda_kt, alpha_k_topic_base_vec);
+      double previous_p_val = shrink(original_Lambda_kt, A);
+      double log_f_x0 = compute_likelihood_terms_threadlocal(k, t, original_Lambda_kt, 
+                                                            tls.alpha_k_topic_base_vec, tls);
       double transformed_log_f_x0 = log_f_x0 - std::log(A * previous_p_val * (1.0 - previous_p_val));
-      slice_level = transformed_log_f_x0 + log(R::unif_rand());
+      double slice_level = transformed_log_f_x0 + std::log(tls.unif_dist(tls.rng));
 
-      start_p = val_min; // shrinked value from settings
-      end_p = val_max;   // shrinked value from settings
+      double start_p = val_min;
+      double end_p = val_max;
 
       // Pre-compute C.col(t) to avoid repeated column access
       const Eigen::VectorXd& C_col_t = C.col(t);
 
       for (int shrink_time = 0; shrink_time < max_shrink_time; ++shrink_time) {
-        new_p_val = sampler::slice_uniform(start_p, end_p); 
+        double new_p_val = start_p + (end_p - start_p) * tls.unif_dist(tls.rng); 
         double proposed_Lambda_kt = expand(new_p_val, A);
         
         // Efficiently compute alpha_k vector for the proposed_Lambda_kt
-        // Delta is from the original_Lambda_kt for this (k,t) sampling step
         double delta_lambda = proposed_Lambda_kt - original_Lambda_kt; 
         
-        // Vectorized computation with pre-allocated memory
-        C_col_t_times_delta.noalias() = C_col_t * delta_lambda;
-        proposed_alpha_k_vec = alpha_k_topic_base_vec.array() * C_col_t_times_delta.array().exp(); // O(Ndoc)
+        // Vectorized computation with thread-local memory
+        tls.C_col_t_times_delta.noalias() = C_col_t * delta_lambda;
+        tls.proposed_alpha_k_vec = tls.alpha_k_topic_base_vec.array() * tls.C_col_t_times_delta.array().exp();
 
-        double log_f_proposed = compute_likelihood_terms(k, t, proposed_Lambda_kt, proposed_alpha_k_vec);
+        double log_f_proposed = compute_likelihood_terms_threadlocal(k, t, proposed_Lambda_kt, 
+                                                                   tls.proposed_alpha_k_vec, tls);
         double transformed_log_f_proposed = log_f_proposed - std::log(A * new_p_val * (1.0 - new_p_val));
 
         if (slice_level < transformed_log_f_proposed) { // Accept proposal
-          Lambda(k,t) = proposed_Lambda_kt;
-          // Update the topic's base log_alpha and alpha_vector due to accepted change in Lambda(k,t)
-          log_alpha_k_topic_base += C_col_t_times_delta; 
-          alpha_k_topic_base_vec = log_alpha_k_topic_base.array().exp();
+          #pragma omp critical(lambda_update)
+          {
+            Lambda(k,t) = proposed_Lambda_kt;
+          }
+          // Update the topic's base log_alpha and alpha_vector due to accepted change
+          tls.log_alpha_k_topic_base += tls.C_col_t_times_delta; 
+          tls.alpha_k_topic_base_vec = tls.log_alpha_k_topic_base.array().exp();
+          current_lambda_k_row(t) = proposed_Lambda_kt; // Update local copy
           break; // Exit shrink_time loop
         } else { // Shrink interval
           if (std::abs(end_p - start_p) < 1e-9) {
             if (verbose) {
-              Rcpp::Rcerr << "Slice sampler interval shrunk too much for Lambda(" << k << "," << t 
-                          << "). Keeping current value: " << original_Lambda_kt << std::endl;
+              #pragma omp critical(error_output)
+              {
+                Rcpp::Rcerr << "Slice sampler interval shrunk too much for Lambda(" << k << "," << t 
+                            << "). Keeping current value: " << original_Lambda_kt << std::endl;
+              }
             }
-            Lambda(k,t) = original_Lambda_kt; // Keep original value
             break;
           }
-          if (previous_p_val < new_p_val) { // Check refers to p_0 vs p_new
+          if (previous_p_val < new_p_val) {
              end_p = new_p_val;
           } else if (new_p_val < previous_p_val) {
              start_p = new_p_val;
           } else {
-            // This case can happen if interval is tiny or due to precision.
             if (verbose) {
-              Rcpp::Rcerr << "Slice sampler new_p equals previous_p for Lambda(" << k << "," << t 
-                          << "). Keeping current value." << std::endl;
+              #pragma omp critical(error_output)
+              {
+                Rcpp::Rcerr << "Slice sampler new_p equals previous_p for Lambda(" << k << "," << t 
+                            << "). Keeping current value." << std::endl;
+              }
             }
-            Lambda(k,t) = original_Lambda_kt;
             break;
           }
         }
       } // End shrink_time loop
     } // End tt loop (covariates)
-
-    // After all t for topic k, Lambda.row(k) is updated. 
-    // Update global Alpha.col(k) and sums using the final alpha_k_topic_base_vec for this topic.
-    for (int d = 0; d < num_doc; ++d) {
-        doc_alpha_sums(d) = doc_alpha_sums(d) - Alpha(d, k) + alpha_k_topic_base_vec(d);
-        doc_alpha_weighted_sums(d) = doc_each_len_weighted[d] + doc_alpha_sums(d);
-        Alpha(d, k) = alpha_k_topic_base_vec(d);
-    }
   } // End kk loop (topics)
+
+  // Update global Alpha matrix and sums after all parallel work is done
+  update_alpha_efficient();
+#else
+  sample_lambda_slice();
+#endif
 }
 
 
@@ -637,50 +791,131 @@ double keyATMcov::loglik_total()
 {
   double loglik = 0.0;
   
-  // Use sequential computation for stability - disable parallelization for now
-  for (int k = 0; k < num_topics; ++k) {
-    for (int v = 0; v < num_vocab; ++v) { // word
-      loglik += mylgamma(beta + n_s0_kv(k, v)) - mylgamma(beta);
-    }
-
-    // word normalization
-    loglik += mylgamma( beta * (double)num_vocab ) - mylgamma(beta * (double)num_vocab + n_s0_k(k) );
-
-    if (k < keyword_k) {
-      // For keyword topics
-
-      // n_s1_kv
-      for (SparseMatrix<double,RowMajor>::InnerIterator it(n_s1_kv, k); it; ++it) {
-        loglik += mylgamma(beta_s + it.value()) - mylgamma(beta_s);
-      }
-      loglik += mylgamma( beta_s * (double)keywords_num[k] ) - mylgamma(beta_s * (double)keywords_num[k] + n_s1_k(k) );
-
-      // Normalization
-      loglik += mylgamma( prior_gamma(k, 0) + prior_gamma(k, 1)) - mylgamma( prior_gamma(k, 0)) - mylgamma( prior_gamma(k, 1));
-
-      // s
-      loglik += mylgamma( n_s0_k(k) + prior_gamma(k, 1) )
-                - mylgamma(n_s1_k(k) + prior_gamma(k, 0) + n_s0_k(k) + prior_gamma(k, 1))
-                + mylgamma( n_s1_k(k) + prior_gamma(k, 0) );
-    }
-  }
-
-  // z - use pre-computed values
-  for (int d = 0; d < num_doc; ++d) {
-    loglik += mylgamma(doc_alpha_sums(d)) - mylgamma(doc_alpha_weighted_sums(d));
+#ifdef _OPENMP
+  if (use_openmp && num_topics > 3) {
+    // Safe parallelization of likelihood computation (read-only operations)
+    double loglik_topics = 0.0;
+    
+    #pragma omp parallel for reduction(+:loglik_topics) num_threads(num_threads) schedule(static)
     for (int k = 0; k < num_topics; ++k) {
-      loglik += mylgamma(n_dk(d,k) + Alpha(d, k)) - mylgamma(Alpha(d, k));
-    }
-  }
+      double topic_loglik = 0.0;
+      
+      // Read-only operations on shared data - thread safe
+      for (int v = 0; v < num_vocab; ++v) {
+        topic_loglik += mylgamma(beta + n_s0_kv(k, v)) - mylgamma(beta);
+      }
 
-  // Lambda loglik - vectorized computation
-  for (int k = 0; k < num_topics; ++k) {
-    for (int t = 0; t < num_cov; ++t) {
-      loglik += log_prior_const;
-      double lambda_diff = Lambda(k,t) - mu;
-      loglik -= lambda_diff * lambda_diff * inv_2sigma_squared;
+      // word normalization
+      topic_loglik += mylgamma( beta * (double)num_vocab ) - mylgamma(beta * (double)num_vocab + n_s0_k(k) );
+
+      if (k < keyword_k) {
+        // For keyword topics - read-only operations
+        for (SparseMatrix<double,RowMajor>::InnerIterator it(n_s1_kv, k); it; ++it) {
+          topic_loglik += mylgamma(beta_s + it.value()) - mylgamma(beta_s);
+        }
+        topic_loglik += mylgamma( beta_s * (double)keywords_num[k] ) - mylgamma(beta_s * (double)keywords_num[k] + n_s1_k(k) );
+
+        // Normalization
+        topic_loglik += mylgamma( prior_gamma(k, 0) + prior_gamma(k, 1)) - mylgamma( prior_gamma(k, 0)) - mylgamma( prior_gamma(k, 1));
+
+        // s
+        topic_loglik += mylgamma( n_s0_k(k) + prior_gamma(k, 1) )
+                      - mylgamma(n_s1_k(k) + prior_gamma(k, 0) + n_s0_k(k) + prior_gamma(k, 1))
+                      + mylgamma( n_s1_k(k) + prior_gamma(k, 0) );
+      }
+      
+      loglik_topics += topic_loglik;
     }
+    
+    loglik += loglik_topics;
+    
+    // Document-level likelihood computation in parallel (read-only)
+    if (num_doc > 1000) {
+      double loglik_docs = 0.0;
+      #pragma omp parallel for reduction(+:loglik_docs) num_threads(num_threads) schedule(static)
+      for (int d = 0; d < num_doc; ++d) {
+        double doc_loglik = mylgamma(doc_alpha_sums(d)) - mylgamma(doc_alpha_weighted_sums(d));
+        for (int k = 0; k < num_topics; ++k) {
+          doc_loglik += mylgamma(n_dk(d,k) + Alpha(d, k)) - mylgamma(Alpha(d, k));
+        }
+        loglik_docs += doc_loglik;
+      }
+      loglik += loglik_docs;
+    } else {
+      // Sequential for small datasets
+      for (int d = 0; d < num_doc; ++d) {
+        loglik += mylgamma(doc_alpha_sums(d)) - mylgamma(doc_alpha_weighted_sums(d));
+        for (int k = 0; k < num_topics; ++k) {
+          loglik += mylgamma(n_dk(d,k) + Alpha(d, k)) - mylgamma(Alpha(d, k));
+        }
+      }
+    }
+    
+  } else {
+#endif
+    // Sequential computation for smaller datasets
+    for (int k = 0; k < num_topics; ++k) {
+      for (int v = 0; v < num_vocab; ++v) { // word
+        loglik += mylgamma(beta + n_s0_kv(k, v)) - mylgamma(beta);
+      }
+
+      // word normalization
+      loglik += mylgamma( beta * (double)num_vocab ) - mylgamma(beta * (double)num_vocab + n_s0_k(k) );
+
+      if (k < keyword_k) {
+        // For keyword topics
+
+        // n_s1_kv
+        for (SparseMatrix<double,RowMajor>::InnerIterator it(n_s1_kv, k); it; ++it) {
+          loglik += mylgamma(beta_s + it.value()) - mylgamma(beta_s);
+        }
+        loglik += mylgamma( beta_s * (double)keywords_num[k] ) - mylgamma(beta_s * (double)keywords_num[k] + n_s1_k(k) );
+
+        // Normalization
+        loglik += mylgamma( prior_gamma(k, 0) + prior_gamma(k, 1)) - mylgamma( prior_gamma(k, 0)) - mylgamma( prior_gamma(k, 1));
+
+        // s
+        loglik += mylgamma( n_s0_k(k) + prior_gamma(k, 1) )
+                  - mylgamma(n_s1_k(k) + prior_gamma(k, 0) + n_s0_k(k) + prior_gamma(k, 1))
+                  + mylgamma( n_s1_k(k) + prior_gamma(k, 0) );
+      }
+    }
+
+    // z - use pre-computed values
+    for (int d = 0; d < num_doc; ++d) {
+      loglik += mylgamma(doc_alpha_sums(d)) - mylgamma(doc_alpha_weighted_sums(d));
+      for (int k = 0; k < num_topics; ++k) {
+        loglik += mylgamma(n_dk(d,k) + Alpha(d, k)) - mylgamma(Alpha(d, k));
+      }
+    }
+#ifdef _OPENMP
   }
+#endif
+
+  // Lambda loglik - can be parallelized safely (read-only)
+#ifdef _OPENMP
+  if (use_openmp && num_topics > 2) {
+    double lambda_loglik = 0.0;
+    #pragma omp parallel for reduction(+:lambda_loglik) num_threads(num_threads) collapse(2)
+    for (int k = 0; k < num_topics; ++k) {
+      for (int t = 0; t < num_cov; ++t) {
+        double lambda_diff = Lambda(k,t) - mu;
+        lambda_loglik += log_prior_const - lambda_diff * lambda_diff * inv_2sigma_squared;
+      }
+    }
+    loglik += lambda_loglik;
+  } else {
+#endif
+    for (int k = 0; k < num_topics; ++k) {
+      for (int t = 0; t < num_cov; ++t) {
+        loglik += log_prior_const;
+        double lambda_diff = Lambda(k,t) - mu;
+        loglik -= lambda_diff * lambda_diff * inv_2sigma_squared;
+      }
+    }
+#ifdef _OPENMP
+  }
+#endif
 
   return loglik;
 }
