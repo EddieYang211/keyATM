@@ -189,8 +189,8 @@ void keyATMcov::sample_lambda_slice()
       t = cov_ids[t_idx];
       
       store_loglik = likelihood_lambda(k, t);
-      start = val_min;
-      end = val_max;
+      start = shrinkp(val_min);
+      end = shrinkp(val_max);
 
       previous_p = shrinkp(Lambda(k,t));
       slice_ = store_loglik - 2.0 * log(1.0 - previous_p) + log(unif_rand());
