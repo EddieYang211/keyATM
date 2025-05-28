@@ -13,6 +13,9 @@
 #include <omp.h>
 #endif
 
+// Thread-safe random number generation
+#include <random>
+
 using namespace Eigen;
 using namespace Rcpp;
 using namespace std;
@@ -66,6 +69,17 @@ class keyATMcov : virtual public keyATMmeta
         Eigen::VectorXd proposed_alpha_k_vec;
         Eigen::VectorXd X_k_proposal;
         Eigen::VectorXd C_col_t_times_delta;
+        
+        // Thread-safe random number generators
+        std::mt19937 rng;
+        std::normal_distribution<double> norm_dist;
+        std::uniform_real_distribution<double> unif_dist;
+        
+        ThreadLocalStorage() : norm_dist(0.0, 1.0), unif_dist(0.0, 1.0) {
+            // Initialize with different seeds for each thread
+            std::random_device rd;
+            rng.seed(rd());
+        }
     };
     
     std::vector<ThreadLocalStorage> thread_storage;
