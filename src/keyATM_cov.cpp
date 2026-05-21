@@ -24,10 +24,19 @@ void keyATMcov::read_data_specific() {
   mh_use = model_settings["mh_use"];
 }
 
+void keyATMcov::refresh_alpha_cache() {
+  // Full rebuild of (Alpha, alpha_sum) from the current Lambda.
+  // Called once at initialization and periodically thereafter to keep
+  // floating-point drift from incremental updates bounded.
+  Alpha = (C * Lambda.transpose()).array().exp();
+  alpha_sum = Alpha.rowwise().sum();
+}
+
 void keyATMcov::initialize_specific() {
   // Alpha
-  Alpha = MatrixXd::Zero(num_doc, num_topics); // used in iteration
-  alpha = VectorXd::Zero(num_topics);          // used in iteration
+  Alpha = MatrixXd::Zero(num_doc, num_topics);
+  alpha_sum = VectorXd::Zero(num_doc);
+  alpha = VectorXd::Zero(num_topics);
 
   // Lambda
   mu = 0.0;
@@ -39,12 +48,17 @@ void keyATMcov::initialize_specific() {
       Lambda(k, i) = R::rnorm(0.0, 0.3);
     }
   }
+
+  refresh_alpha_cache();
+  alpha_refresh_every = 100;
+  alpha_refresh_counter = alpha_refresh_every;
 }
 
 void keyATMcov::resume_initialize_specific() {
   // Alpha
   Alpha = MatrixXd::Zero(num_doc, num_topics);
-  alpha = VectorXd::Zero(num_topics); // used in iteration
+  alpha_sum = VectorXd::Zero(num_doc);
+  alpha = VectorXd::Zero(num_topics);
 
   // Lambda
   mu = 0.0;
@@ -53,6 +67,10 @@ void keyATMcov::resume_initialize_specific() {
   List Lambda_iter = stored_values["Lambda_iter"];
   NumericMatrix Lambda_r = Lambda_iter[Lambda_iter.size() - 1];
   Lambda = Rcpp::as<Eigen::MatrixXd>(Lambda_r);
+
+  refresh_alpha_cache();
+  alpha_refresh_every = 100;
+  alpha_refresh_counter = alpha_refresh_every;
 }
 
 void keyATMcov::iteration_single(int it) { // Single iteration
@@ -62,10 +80,14 @@ void keyATMcov::iteration_single(int it) { // Single iteration
   int new_z, new_s;
   int w_position;
 
-  doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
+  // Periodic full rebuild to control drift in the incremental cache.
+  --alpha_refresh_counter;
+  if (alpha_refresh_counter <= 0) {
+    refresh_alpha_cache();
+    alpha_refresh_counter = alpha_refresh_every;
+  }
 
-  // Create Alpha for this iteration
-  Alpha = (C * Lambda.transpose()).array().exp();
+  doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
 
   for (int ii = 0; ii < num_doc; ++ii) {
     doc_id_ = doc_indexes[ii];
@@ -112,29 +134,29 @@ void keyATMcov::sample_parameters(int it) {
   }
 }
 
-double keyATMcov::likelihood_lambda(int k, int t) {
+double keyATMcov::likelihood_lambda_eval(int k, double Lambda_eval,
+                                         const VectorXd &cand_col,
+                                         const VectorXd &cand_sum) {
+  // Evaluate the part of the posterior over Lambda(k, *) that depends on
+  // Lambda(k, t), given a candidate column for topic k of Alpha
+  // (cand_col(d) = exp(C(d,:) * Lambda(k,:)^T) under the candidate) and the
+  // corresponding row-sum vector (cand_sum(d) = sum_k' Alpha(d, k')).
+  //
+  // The doc-level integrand uses only alpha.sum() and alpha(k) for the
+  // current topic k, so other columns of Alpha cancel out exactly.
   double loglik = 0.0;
-  Alpha = (C * Lambda.transpose()).array().exp();
-  alpha = VectorXd::Zero(num_topics);
-
   for (int d = 0; d < num_doc; ++d) {
-    alpha = Alpha.row(d).transpose(); // Doc alpha, column vector
-
-    loglik += mylgamma(alpha.sum());
-    // the first term numerator in the first square bracket
-    loglik -= mylgamma(doc_each_len_weighted[d] + alpha.sum());
-    // the second term denoinator in the first square bracket
-
-    loglik -= mylgamma(alpha(k));
-    // the first term denominator in the first square bracket
-    loglik += mylgamma(n_dk(d, k) + alpha(k));
-    // the second term numerator in the firist square bracket
+    const double s_d = cand_sum(d);
+    const double c_d = cand_col(d);
+    loglik += mylgamma(s_d);
+    loglik -= mylgamma(doc_each_len_weighted[d] + s_d);
+    loglik -= mylgamma(c_d);
+    loglik += mylgamma(n_dk(d, k) + c_d);
   }
 
-  // Prior
+  // Gaussian prior on Lambda(k, t)
   loglik += -0.5 * log(2.0 * PI_V * std::pow(sigma, 2.0));
-  loglik -= (std::pow((Lambda(k, t) - mu), 2.0) / (2.0 * std::pow(sigma, 2.0)));
-
+  loglik -= (std::pow((Lambda_eval - mu), 2.0) / (2.0 * std::pow(sigma, 2.0)));
   return loglik;
 }
 
@@ -145,14 +167,15 @@ void keyATMcov::sample_lambda() {
 void keyATMcov::sample_lambda_mh() {
   topic_ids = sampler::shuffled_indexes(num_topics);
   cov_ids = sampler::shuffled_indexes(num_cov);
-  double Lambda_current = 0.0;
-  double llk_current = 0.0;
-  double llk_proposal = 0.0;
-  double diffllk = 0.0;
-  double r = 0.0;
-  double u = 0.0;
-  double mh_sigma = 0.4;
+  const double mh_sigma = 0.4;
   int k, t;
+
+  // Scratch buffers reused across the K * num_cov updates.
+  VectorXd col_old(num_doc);
+  VectorXd col_new(num_doc);
+  VectorXd sum_cand(num_doc);
+  VectorXd factor(num_doc);
+  VectorXd c_col_t(num_doc);
 
   for (int kk = 0; kk < num_topics; ++kk) {
     k = topic_ids[kk];
@@ -160,79 +183,98 @@ void keyATMcov::sample_lambda_mh() {
     for (int tt = 0; tt < num_cov; ++tt) {
       t = cov_ids[tt];
 
-      Lambda_current = Lambda(k, t);
+      const double Lambda_init = Lambda(k, t);
+      col_old = Alpha.col(k);
+      c_col_t = C.col(t);
 
-      // Current llk
-      llk_current = likelihood_lambda(k, t);
+      const double llk_current =
+          likelihood_lambda_eval(k, Lambda_init, col_old, alpha_sum);
 
       // Proposal
-      Lambda(k, t) += R::rnorm(0.0, mh_sigma);
-      llk_proposal = likelihood_lambda(k, t);
+      const double Lambda_cand = Lambda_init + R::rnorm(0.0, mh_sigma);
+      const double delta = Lambda_cand - Lambda_init;
+      factor = (delta * c_col_t.array()).exp();
+      col_new = col_old.array() * factor.array();
+      sum_cand = alpha_sum - col_old + col_new;
 
-      diffllk = llk_proposal - llk_current;
-      r = std::min(0.0, diffllk);
-      u = log(unif_rand());
+      const double llk_proposal =
+          likelihood_lambda_eval(k, Lambda_cand, col_new, sum_cand);
+
+      const double diffllk = llk_proposal - llk_current;
+      const double r = std::min(0.0, diffllk);
+      const double u = log(unif_rand());
 
       if (u < r) {
-        // accepted
-      } else {
-        // Put back original values
-        Lambda(k, t) = Lambda_current;
+        // accepted: commit
+        Lambda(k, t) = Lambda_cand;
+        Alpha.col(k) = col_new;
+        alpha_sum = sum_cand;
       }
+      // rejected: nothing to roll back, no commit happened
     }
   }
 }
 
 void keyATMcov::sample_lambda_slice() {
-  double start = 0.0;
-  double end = 0.0;
-
-  double previous_p = 0.0;
-  double new_p = 0.0;
-
-  double newlikelihood = 0.0;
-  double slice_ = 0.0;
-  double current_lambda = 0.0;
-
-  double store_loglik;
-  double newlambdallk;
-
   topic_ids = sampler::shuffled_indexes(num_topics);
   cov_ids = sampler::shuffled_indexes(num_cov);
-  int k, t;
   const double A = slice_A;
+  int k, t;
 
-  newlambdallk = 0.0;
+  // Scratch buffers reused across the K * num_cov updates.
+  VectorXd col_old(num_doc);
+  VectorXd col_new(num_doc);
+  VectorXd sum_cand(num_doc);
+  VectorXd factor(num_doc);
+  VectorXd c_col_t(num_doc);
 
   for (int kk = 0; kk < num_topics; ++kk) {
     k = topic_ids[kk];
 
     for (int tt = 0; tt < num_cov; ++tt) {
       t = cov_ids[tt];
-      store_loglik = likelihood_lambda(k, t);
 
-      start = val_min; // shrinked value
-      end = val_max;   // shrinked value
+      const double Lambda_init = Lambda(k, t);
+      col_old = Alpha.col(k);
+      c_col_t = C.col(t);
 
-      current_lambda = Lambda(k, t);
-      previous_p = shrink(current_lambda, A);
-      slice_ = store_loglik - std::log(A * previous_p * (1.0 - previous_p)) +
-               log(unif_rand()); // <-- using R random uniform
+      const double store_loglik =
+          likelihood_lambda_eval(k, Lambda_init, col_old, alpha_sum);
+
+      double start = val_min; // shrinked value
+      double end = val_max;   // shrinked value
+
+      const double previous_p = shrink(Lambda_init, A);
+      const double slice_ = store_loglik
+                            - std::log(A * previous_p * (1.0 - previous_p))
+                            + log(unif_rand()); // <-- using R random uniform
 
       for (int shrink_time = 0; shrink_time < max_shrink_time; ++shrink_time) {
-        new_p =
-            sampler::slice_uniform(start, end); // <-- using R function above
-        Lambda(k, t) = expand(new_p, A);        // expand
+        const double new_p = sampler::slice_uniform(start, end);
+        const double Lambda_cand = expand(new_p, A); // expand
+        const double delta = Lambda_cand - Lambda_init;
 
-        newlambdallk = likelihood_lambda(k, t);
+        // Incremental update of column k of Alpha and the row sum.
+        //   Alpha_new(d, k) = Alpha_old(d, k) * exp(delta * C(d, t))
+        //   alpha_sum_new(d) = alpha_sum(d) - col_old(d) + col_new(d)
+        factor = (delta * c_col_t.array()).exp();
+        col_new = col_old.array() * factor.array();
+        sum_cand = alpha_sum - col_old + col_new;
 
-        newlikelihood = newlambdallk - std::log(A * new_p * (1.0 - new_p));
+        const double cand_llk =
+            likelihood_lambda_eval(k, Lambda_cand, col_new, sum_cand);
+        const double newlikelihood =
+            cand_llk - std::log(A * new_p * (1.0 - new_p));
 
         if (slice_ < newlikelihood) {
+          // Accept: commit candidate
+          Lambda(k, t) = Lambda_cand;
+          Alpha.col(k) = col_new;
+          alpha_sum = sum_cand;
           break;
-        } else if (abs(end - start) < 1e-9) {
+        } else if (std::abs(end - start) < 1e-9) {
           Rcerr << "Shrinked too much. Using a current value." << std::endl;
-          Lambda(k, t) = current_lambda;
+          // Keep Lambda(k, t), Alpha.col(k), and alpha_sum at their initial values.
           break;
         } else if (previous_p < new_p) {
           end = new_p;
@@ -242,11 +284,9 @@ void keyATMcov::sample_lambda_slice() {
           Rcpp::stop("Something goes wrong in sample_lambda_slice(). Adjust "
                      "`A_slice`.");
         }
-
-      } // for loop for shrink time
-
-    } // for loop for num_cov
-  } // for loop for num_topics
+      } // shrink loop
+    } // cov loop
+  } // topic loop
 }
 
 double keyATMcov::loglik_total() {
@@ -283,22 +323,18 @@ double keyATMcov::loglik_total() {
     }
   }
 
-  // z
-  Alpha = (C * Lambda.transpose()).array().exp();
-  alpha = VectorXd::Zero(num_topics);
-
+  // z: use cached Alpha and alpha_sum directly (kept in sync by the sampler)
   for (int d = 0; d < num_doc; ++d) {
-    alpha = Alpha.row(d).transpose(); // Doc alpha, column vector
-
-    loglik += mylgamma(alpha.sum()) -
-              mylgamma(doc_each_len_weighted[d] + alpha.sum());
+    const double s_d = alpha_sum(d);
+    loglik += mylgamma(s_d) - mylgamma(doc_each_len_weighted[d] + s_d);
     for (int k = 0; k < num_topics; ++k) {
-      loglik += mylgamma(n_dk(d, k) + alpha(k)) - mylgamma(alpha(k));
+      const double a_dk = Alpha(d, k);
+      loglik += mylgamma(n_dk(d, k) + a_dk) - mylgamma(a_dk);
     }
   }
 
   // Lambda loglik
-  double prior_fixedterm = -0.5 * log(2.0 * PI_V * std::pow(sigma, 2.0));
+  const double prior_fixedterm = -0.5 * log(2.0 * PI_V * std::pow(sigma, 2.0));
   for (int k = 0; k < num_topics; ++k) {
     for (int t = 0; t < num_cov; ++t) {
       loglik += prior_fixedterm;

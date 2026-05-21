@@ -14,10 +14,16 @@ void LDAcov::iteration_single(int it) { // Single iteration
   int w_position;
 
   s_ = -1;
-  doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
 
-  // Create Alpha for this iteration
-  Alpha = (C * Lambda.transpose()).array().exp();
+  // Periodic full rebuild of (Alpha, alpha_sum) to control drift.
+  // Between rebuilds, sample_lambda_slice/mh keep both in sync incrementally.
+  --alpha_refresh_counter;
+  if (alpha_refresh_counter <= 0) {
+    refresh_alpha_cache();
+    alpha_refresh_counter = alpha_refresh_every;
+  }
+
+  doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
 
   for (int ii = 0; ii < num_doc; ++ii) {
     doc_id_ = doc_indexes[ii];
@@ -55,17 +61,13 @@ double LDAcov::loglik_total() {
               mylgamma(beta * (double)num_vocab + n_k(k));
   }
 
-  // z
-  Alpha = (C * Lambda.transpose()).array().exp();
-  alpha = VectorXd::Zero(num_topics);
-
+  // z: use the cached Alpha and alpha_sum (kept in sync by the Lambda sampler).
   for (int d = 0; d < num_doc; ++d) {
-    alpha = Alpha.row(d).transpose(); // Doc alpha, column vector
-
-    loglik += mylgamma(alpha.sum()) -
-              mylgamma(doc_each_len_weighted[d] + alpha.sum());
+    const double s_d = alpha_sum(d);
+    loglik += mylgamma(s_d) - mylgamma(doc_each_len_weighted[d] + s_d);
     for (int k = 0; k < num_topics; ++k) {
-      loglik += mylgamma(n_dk(d, k) + alpha(k)) - mylgamma(alpha(k));
+      const double a_dk = Alpha(d, k);
+      loglik += mylgamma(n_dk(d, k) + a_dk) - mylgamma(a_dk);
     }
   }
 

@@ -17,7 +17,8 @@ public:
   //
   // Parameters
   //
-  MatrixXd Alpha;
+  MatrixXd Alpha;       // num_doc x num_topics, exp(C * Lambda^T)
+  VectorXd alpha_sum;   // num_doc, row sums of Alpha (kept in sync)
   int num_cov;
   MatrixXd Lambda;
   MatrixXd C;
@@ -33,6 +34,10 @@ public:
   // Slice sampling
   double val_min;
   double val_max;
+
+  // Periodic full rebuild of (Alpha, alpha_sum) to control floating-point drift
+  int alpha_refresh_counter;
+  int alpha_refresh_every;
 
   //
   // Functions
@@ -59,8 +64,14 @@ public:
   double alpha_loglik();
   virtual double loglik_total() override;
 
-  double likelihood_lambda(int k, int t);
-  void proposal_lambda(int k);
+  // Rebuild Alpha = exp(C * Lambda^T) and alpha_sum from scratch
+  void refresh_alpha_cache();
+
+  // Evaluate log p(Lambda_eval, data | ...) using a candidate column for topic k
+  // and its corresponding alpha_sum. Adds Gaussian prior on Lambda_eval.
+  double likelihood_lambda_eval(int k, double Lambda_eval,
+                                const Eigen::VectorXd &cand_col,
+                                const Eigen::VectorXd &cand_sum);
 };
 
 #endif
