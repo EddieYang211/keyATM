@@ -77,6 +77,11 @@ public:
   VectorXd Vbeta_k;
   VectorXd Lbeta_sk;
 
+  // Row-major variant for matrices whose hot access pattern is by-document
+  // (sample_z reads n_dk(doc, k) across all k for a fixed doc).
+  typedef Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>
+      RowMatrixXd;
+
   List options_list;
   List Z_tables;
   List priors_list;
@@ -98,10 +103,13 @@ public:
   // Latent Variables
   //
   MatrixXd n_s0_kv;
-  SparseMatrix<double, RowMajor> n_s1_kv;
-  typedef Eigen::Triplet<double> Triplet;
-  MatrixXd n_dk;
-  MatrixXd n_dk_noWeight;
+  // n_s1_kv is logically sparse (only (k, w) where w is a keyword of topic k
+  // can be non-zero), but the keyword set per topic is small, so we store it
+  // dense to make sample_z's O(1) coefficient access cache-friendly. Iterate
+  // by topic via the keywords[k] set, not over all V entries.
+  MatrixXd n_s1_kv;
+  RowMatrixXd n_dk;
+  RowMatrixXd n_dk_noWeight;
   VectorXd n_s0_k;
   VectorXd n_s1_k;
   VectorXd vocab_weights;

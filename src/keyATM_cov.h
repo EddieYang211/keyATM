@@ -69,9 +69,13 @@ public:
 
   // Evaluate log p(Lambda_eval, data | ...) using a candidate column for topic k
   // and its corresponding alpha_sum. Adds Gaussian prior on Lambda_eval.
+  // n_dk_col_k is a contiguous copy of n_dk.col(k) — n_dk is row-major so a
+  // strided .col() view would defeat prefetching; materializing it once per
+  // outer k loop in the caller makes the d-loop a flat array scan.
   double likelihood_lambda_eval(int k, double Lambda_eval,
                                 const Eigen::VectorXd &cand_col,
-                                const Eigen::VectorXd &cand_sum);
+                                const Eigen::VectorXd &cand_sum,
+                                const Eigen::VectorXd &n_dk_col_k);
 };
 
 #endif

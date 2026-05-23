@@ -87,14 +87,14 @@ void keyATMcov::iteration_single(int it) { // Single iteration
     alpha_refresh_counter = alpha_refresh_every;
   }
 
-  doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
+  sampler::shuffle_in_place(doc_indexes, num_doc); // shuffle
 
   for (int ii = 0; ii < num_doc; ++ii) {
     doc_id_ = doc_indexes[ii];
     doc_s = S[doc_id_], doc_z = Z[doc_id_], doc_w = W[doc_id_];
     doc_length = doc_each_len[doc_id_];
 
-    token_indexes = sampler::shuffled_indexes(doc_length); // shuffle
+    sampler::shuffle_in_place(token_indexes, doc_length); // shuffle
 
     // Prepare Alpha for the doc
     alpha = Alpha.row(doc_id_).transpose(); // take out alpha
@@ -136,7 +136,8 @@ void keyATMcov::sample_parameters(int it) {
 
 double keyATMcov::likelihood_lambda_eval(int k, double Lambda_eval,
                                          const VectorXd &cand_col,
-                                         const VectorXd &cand_sum) {
+                                         const VectorXd &cand_sum,
+                                         const VectorXd &n_dk_col_k) {
   // Evaluate the part of the posterior over Lambda(k, *) that depends on
   // Lambda(k, t), given a candidate column for topic k of Alpha
   // (cand_col(d) = exp(C(d,:) * Lambda(k,:)^T) under the candidate) and the
@@ -151,7 +152,7 @@ double keyATMcov::likelihood_lambda_eval(int k, double Lambda_eval,
     loglik += mylgamma(s_d);
     loglik -= mylgamma(doc_each_len_weighted[d] + s_d);
     loglik -= mylgamma(c_d);
-    loglik += mylgamma(n_dk(d, k) + c_d);
+    loglik += mylgamma(n_dk_col_k(d) + c_d);
   }
 
   // Gaussian prior on Lambda(k, t)
@@ -176,9 +177,14 @@ void keyATMcov::sample_lambda_mh() {
   VectorXd sum_cand(num_doc);
   VectorXd factor(num_doc);
   VectorXd c_col_t(num_doc);
+  VectorXd n_dk_col_k(num_doc);
 
   for (int kk = 0; kk < num_topics; ++kk) {
     k = topic_ids[kk];
+
+    // n_dk is row-major; materialize a contiguous copy of column k once per
+    // topic so likelihood_lambda_eval's d-loop scans flat memory.
+    n_dk_col_k = n_dk.col(k);
 
     for (int tt = 0; tt < num_cov; ++tt) {
       t = cov_ids[tt];
@@ -187,8 +193,8 @@ void keyATMcov::sample_lambda_mh() {
       col_old = Alpha.col(k);
       c_col_t = C.col(t);
 
-      const double llk_current =
-          likelihood_lambda_eval(k, Lambda_init, col_old, alpha_sum);
+      const double llk_current = likelihood_lambda_eval(
+          k, Lambda_init, col_old, alpha_sum, n_dk_col_k);
 
       // Proposal
       const double Lambda_cand = Lambda_init + R::rnorm(0.0, mh_sigma);
@@ -197,8 +203,8 @@ void keyATMcov::sample_lambda_mh() {
       col_new = col_old.array() * factor.array();
       sum_cand = alpha_sum - col_old + col_new;
 
-      const double llk_proposal =
-          likelihood_lambda_eval(k, Lambda_cand, col_new, sum_cand);
+      const double llk_proposal = likelihood_lambda_eval(
+          k, Lambda_cand, col_new, sum_cand, n_dk_col_k);
 
       const double diffllk = llk_proposal - llk_current;
       const double r = std::min(0.0, diffllk);
@@ -227,9 +233,14 @@ void keyATMcov::sample_lambda_slice() {
   VectorXd sum_cand(num_doc);
   VectorXd factor(num_doc);
   VectorXd c_col_t(num_doc);
+  VectorXd n_dk_col_k(num_doc);
 
   for (int kk = 0; kk < num_topics; ++kk) {
     k = topic_ids[kk];
+
+    // n_dk is row-major; materialize a contiguous copy of column k once per
+    // topic so likelihood_lambda_eval's d-loop scans flat memory.
+    n_dk_col_k = n_dk.col(k);
 
     for (int tt = 0; tt < num_cov; ++tt) {
       t = cov_ids[tt];
@@ -238,8 +249,8 @@ void keyATMcov::sample_lambda_slice() {
       col_old = Alpha.col(k);
       c_col_t = C.col(t);
 
-      const double store_loglik =
-          likelihood_lambda_eval(k, Lambda_init, col_old, alpha_sum);
+      const double store_loglik = likelihood_lambda_eval(
+          k, Lambda_init, col_old, alpha_sum, n_dk_col_k);
 
       double start = val_min; // shrinked value
       double end = val_max;   // shrinked value
@@ -261,8 +272,8 @@ void keyATMcov::sample_lambda_slice() {
         col_new = col_old.array() * factor.array();
         sum_cand = alpha_sum - col_old + col_new;
 
-        const double cand_llk =
-            likelihood_lambda_eval(k, Lambda_cand, col_new, sum_cand);
+        const double cand_llk = likelihood_lambda_eval(
+            k, Lambda_cand, col_new, sum_cand, n_dk_col_k);
         const double newlikelihood =
             cand_llk - std::log(A * new_p * (1.0 - new_p));
 
@@ -303,10 +314,13 @@ double keyATMcov::loglik_total() {
     if (k < keyword_k) {
       // For keyword topics
 
-      // n_s1_kv
-      for (SparseMatrix<double, RowMajor>::InnerIterator it(n_s1_kv, k); it;
-           ++it) {
-        loglik += mylgamma(beta_s + it.value()) - mylgamma(beta_s);
+      // n_s1_kv (dense; zero entries contribute exactly zero so a full
+      // column scan is bit-identical to the prior sparse iteration).
+      for (int v = 0; v < num_vocab; ++v) {
+        const double val = n_s1_kv(k, v);
+        if (val != 0.0) {
+          loglik += mylgamma(beta_s + val) - mylgamma(beta_s);
+        }
       }
       loglik += mylgamma(beta_s * (double)keywords_num[k]) -
                 mylgamma(beta_s * (double)keywords_num[k] + n_s1_k(k));

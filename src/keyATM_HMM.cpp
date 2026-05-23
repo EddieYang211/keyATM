@@ -156,7 +156,7 @@ void keyATMhmm::iteration_single(int it) { // Single iteration
   int new_z, new_s;
   int w_position;
 
-  doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
+  sampler::shuffle_in_place(doc_indexes, num_doc); // shuffle
 
   for (int ii = 0; ii < num_doc; ++ii) {
     doc_id_ = doc_indexes[ii];
@@ -166,7 +166,7 @@ void keyATMhmm::iteration_single(int it) { // Single iteration
     alpha = alphas.row(get_state_index(doc_id_))
                 .transpose(); // select alpha for this document
 
-    token_indexes = sampler::shuffled_indexes(doc_length); // shuffle
+    sampler::shuffle_in_place(token_indexes, doc_length); // shuffle
 
     // Iterate each word in the document
     for (int jj = 0; jj < doc_length; ++jj) {
@@ -490,11 +490,13 @@ double keyATMhmm::loglik_total() {
     if (k < keyword_k) {
       // For keyword topics
 
-      // n_s1_kv
-      for (SparseMatrix<double, RowMajor>::InnerIterator it(n_s1_kv, k); it;
-           ++it) {
-        loglik += mylgamma(beta_s + it.value() / vocab_weights(it.index())) -
-                  mylgamma(beta_s);
+      // n_s1_kv (dense; zero entries contribute exactly zero so a full
+      // column scan is bit-identical to the prior sparse iteration).
+      for (int v = 0; v < num_vocab; ++v) {
+        const double val = n_s1_kv(k, v);
+        if (val != 0.0) {
+          loglik += mylgamma(beta_s + val / vocab_weights(v)) - mylgamma(beta_s);
+        }
       }
       loglik += mylgamma(beta_s * (double)keywords_num[k]) -
                 mylgamma(beta_s * (double)keywords_num[k] + n_s1_k(k));

@@ -25,6 +25,21 @@ std::vector<int> shuffled_indexes(const int m) {
   return v;
 }
 
+void shuffle_in_place(std::vector<int> &v, const int m) {
+  // In-place equivalent of shuffled_indexes. Reuses the buffer's capacity to
+  // avoid per-call heap allocation in inner loops. RNG consumption order
+  // matches shuffled_indexes() for bit-identical permutations.
+  if ((int)v.size() < m) {
+    v.resize(m);
+  }
+  std::iota(v.begin(), v.begin() + m, 0);
+  int j;
+  for (int i = 0; i < m - 1; ++i) {
+    j = i + rand_wrapper(m - i);
+    std::swap(v[i], v[j]);
+  }
+}
+
 int rcat(Eigen::VectorXd &prob, const int size) {
   double u = R::unif_rand();
   double temp = 0.0;

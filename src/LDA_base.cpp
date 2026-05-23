@@ -106,8 +106,8 @@ void LDAbase::initialize_common() {
   // Construct data matrices
   //
   n_kv = MatrixXd::Zero(num_topics, num_vocab);
-  n_dk = MatrixXd::Zero(num_doc, num_topics);
-  n_dk_noWeight = MatrixXd::Zero(num_doc, num_topics);
+  n_dk = RowMatrixXd::Zero(num_doc, num_topics);
+  n_dk_noWeight = RowMatrixXd::Zero(num_doc, num_topics);
   n_k = VectorXd::Zero(num_topics);
 
   total_words_weighted = 0.0;

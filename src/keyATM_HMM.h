@@ -57,7 +57,9 @@ public:
   // Slice Sampling
   std::vector<int> topic_ids;
   VectorXd keep_current_param;
-  MatrixXd ndk_a;
+  // Row-major to match n_dk (avoids an implicit layout-transposition copy
+  // on every broadcast assignment).
+  RowMatrixXd ndk_a;
 
   //
   // Functions

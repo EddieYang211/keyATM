@@ -25,8 +25,9 @@ public:
   double store_loglik;
   double newalphallk;
 
-  // in alpha_loglik
-  MatrixXd ndk_a;
+  // in alpha_loglik. Row-major to match n_dk (avoids an implicit
+  // layout-transposition copy on every broadcast assignment).
+  RowMatrixXd ndk_a;
 
   //
   // Functions

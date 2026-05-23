@@ -29,14 +29,14 @@ void keyATMcovPG::iteration_single(int it) { // Single iteration
 
   sample_parameters(it);
 
-  doc_indexes = sampler::shuffled_indexes(num_doc); // shuffle
+  sampler::shuffle_in_place(doc_indexes, num_doc); // shuffle
 
   for (int ii = 0; ii < num_doc; ++ii) {
     doc_id_ = doc_indexes[ii];
     doc_s = S[doc_id_], doc_z = Z[doc_id_], doc_w = W[doc_id_];
     doc_length = doc_each_len[doc_id_];
 
-    token_indexes = sampler::shuffled_indexes(doc_length); // shuffle
+    sampler::shuffle_in_place(token_indexes, doc_length); // shuffle
 
     // Iterate each word in the document
     for (int jj = 0; jj < doc_length; ++jj) {
@@ -108,7 +108,7 @@ int keyATMcovPG::sample_z_PG(int z, int s, int w, int doc_id) {
     n_s0_kv(z, w) -= vocab_weights(w);
     n_s0_k(z) -= vocab_weights(w);
   } else if (s == 1) {
-    n_s1_kv.coeffRef(z, w) -= vocab_weights(w);
+    n_s1_kv(z, w) -= vocab_weights(w);
     n_s1_k(z) -= vocab_weights(w);
   } else {
     Rcerr << "Error at sample_z, remove" << std::endl;
@@ -140,7 +140,7 @@ int keyATMcovPG::sample_z_PG(int z, int s, int w, int doc_id) {
         z_prob_vec(k) = 0.0;
         continue;
       } else {
-        numerator = (beta_s + n_s1_kv.coeffRef(k, w)) *
+        numerator = (beta_s + n_s1_kv(k, w)) *
                     (n_s1_k(k) + prior_gamma(k, 0)) * theta(doc_id, k);
         denominator =
             (Lbeta_sk(k) + n_s1_k(k)) *
@@ -160,7 +160,7 @@ int keyATMcovPG::sample_z_PG(int z, int s, int w, int doc_id) {
     n_s0_kv(new_z, w) += vocab_weights(w);
     n_s0_k(new_z) += vocab_weights(w);
   } else if (s == 1) {
-    n_s1_kv.coeffRef(new_z, w) += vocab_weights(w);
+    n_s1_kv(new_z, w) += vocab_weights(w);
     n_s1_k(new_z) += vocab_weights(w);
   } else {
     Rcerr << "Error at sample_z, add" << std::endl;
@@ -185,10 +185,13 @@ double keyATMcovPG::loglik_total() {
     if (k < keyword_k) {
       // For keyword topics
 
-      // n_s1_kv
-      for (SparseMatrix<double, RowMajor>::InnerIterator it(n_s1_kv, k); it;
-           ++it) {
-        loglik += mylgamma(beta_s + it.value()) - mylgamma(beta_s);
+      // n_s1_kv (dense; zero entries contribute exactly zero so a full
+      // column scan is bit-identical to the prior sparse iteration).
+      for (int v = 0; v < num_vocab; ++v) {
+        const double val = n_s1_kv(k, v);
+        if (val != 0.0) {
+          loglik += mylgamma(beta_s + val) - mylgamma(beta_s);
+        }
       }
       loglik += mylgamma(beta_s * (double)keywords_num[k]) -
                 mylgamma(beta_s * (double)keywords_num[k] + n_s1_k(k));
