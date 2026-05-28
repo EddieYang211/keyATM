@@ -23,6 +23,19 @@ public:
   MatrixXd Lambda;
   MatrixXd C;
 
+  // Per-covariate nonzero-document structure (column-compressed view of C).
+  // Updating Lambda(k, t) only changes documents with C(d, t) != 0: for every
+  // other document the multiplicative factor is exp(delta * 0) = 1, so its
+  // Alpha entry, alpha_sum, and all four log-gamma terms are bit-for-bit
+  // identical between the current and candidate states and cancel exactly in
+  // the slice / Metropolis-Hastings acceptance ratio. Iterating only over the
+  // nonzero documents turns each Lambda sweep from O(num_cov * num_doc) into
+  // O(nnz(C)) — a large win when the covariate matrix is sparse, which it is
+  // whenever factor variables are dummy-coded (the common case, and maximally
+  // so under `standardize = "none"`, where the 0/1 dummies keep exact zeros).
+  std::vector<std::vector<int>> cov_nz_idx;    // cov_nz_idx[t]: doc ids, ascending
+  std::vector<std::vector<double>> cov_nz_val; // matching C(d, t) values
+
   int mh_use;
   double mu;
   double sigma;
@@ -67,15 +80,22 @@ public:
   // Rebuild Alpha = exp(C * Lambda^T) and alpha_sum from scratch
   void refresh_alpha_cache();
 
-  // Evaluate log p(Lambda_eval, data | ...) using a candidate column for topic k
-  // and its corresponding alpha_sum. Adds Gaussian prior on Lambda_eval.
-  // n_dk_col_k is a contiguous copy of n_dk.col(k) — n_dk is row-major so a
-  // strided .col() view would defeat prefetching; materializing it once per
-  // outer k loop in the caller makes the d-loop a flat array scan.
-  double likelihood_lambda_eval(int k, double Lambda_eval,
-                                const Eigen::VectorXd &cand_col,
-                                const Eigen::VectorXd &cand_sum,
-                                const Eigen::VectorXd &n_dk_col_k);
+  // Build cov_nz_idx / cov_nz_val from C. Call once after C is read.
+  void build_cov_sparsity();
+
+  // Change in the doc-likelihood part of the Lambda log-posterior when
+  // Lambda(k, t) moves by `delta`, accumulated over the documents with
+  // C(d, t) != 0. This equals (candidate - current) log-likelihood in the old
+  // dense formulation: zero-covariate documents are skipped because each of
+  // their four log-gamma differences is exactly 0 and `acc += 0` is a no-op in
+  // IEEE-754, so the result is identical to summing over every document.
+  double lambda_loglik_diff(int k, int t, double delta);
+
+  // Commit an accepted Lambda(k, t) move: write Lambda and refresh the cached
+  // Alpha column and alpha_sum for the affected documents only. Uses the
+  // `alpha_sum += (c_new - c_old)` form so that untouched documents (c_new ==
+  // c_old) are exact no-ops, keeping the sparse update equal to a dense one.
+  void commit_lambda(int k, int t, double delta, double Lambda_cand);
 };
 
 #endif

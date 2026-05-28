@@ -22,6 +22,27 @@ void keyATMcov::read_data_specific() {
 
   // Metropolis Hastings
   mh_use = model_settings["mh_use"];
+
+  // Column-compressed nonzero structure of C, used to restrict each Lambda
+  // update to the documents it can actually change (see keyATM_cov.h).
+  build_cov_sparsity();
+}
+
+void keyATMcov::build_cov_sparsity() {
+  cov_nz_idx.assign(num_cov, std::vector<int>());
+  cov_nz_val.assign(num_cov, std::vector<double>());
+  // C is column-major, so scanning d (rows) within a fixed t (column) is a
+  // contiguous pass. Document ids are appended in ascending order, which makes
+  // the sparse accumulation order match a dense d = 0..num_doc-1 scan.
+  for (int t = 0; t < num_cov; ++t) {
+    for (int d = 0; d < num_doc; ++d) {
+      const double v = C(d, t);
+      if (v != 0.0) {
+        cov_nz_idx[t].push_back(d);
+        cov_nz_val[t].push_back(v);
+      }
+    }
+  }
 }
 
 void keyATMcov::refresh_alpha_cache() {
@@ -134,31 +155,48 @@ void keyATMcov::sample_parameters(int it) {
   }
 }
 
-double keyATMcov::likelihood_lambda_eval(int k, double Lambda_eval,
-                                         const VectorXd &cand_col,
-                                         const VectorXd &cand_sum,
-                                         const VectorXd &n_dk_col_k) {
-  // Evaluate the part of the posterior over Lambda(k, *) that depends on
-  // Lambda(k, t), given a candidate column for topic k of Alpha
-  // (cand_col(d) = exp(C(d,:) * Lambda(k,:)^T) under the candidate) and the
-  // corresponding row-sum vector (cand_sum(d) = sum_k' Alpha(d, k')).
-  //
-  // The doc-level integrand uses only alpha.sum() and alpha(k) for the
-  // current topic k, so other columns of Alpha cancel out exactly.
-  double loglik = 0.0;
-  for (int d = 0; d < num_doc; ++d) {
-    const double s_d = cand_sum(d);
-    const double c_d = cand_col(d);
-    loglik += mylgamma(s_d);
-    loglik -= mylgamma(doc_each_len_weighted[d] + s_d);
-    loglik -= mylgamma(c_d);
-    loglik += mylgamma(n_dk_col_k(d) + c_d);
-  }
+double keyATMcov::lambda_loglik_diff(int k, int t, double delta) {
+  // Sum over the documents with C(d, t) != 0 of the change in the per-document
+  // log-likelihood integrand when Lambda(k, t) moves by `delta`. For topic k
+  // the integrand depends only on alpha_sum(d) and Alpha(d, k); both move by
+  // the same multiplicative factor exp(delta * C(d, t)), so all other columns
+  // cancel. Documents with C(d, t) == 0 have factor 1 and contribute exactly
+  // 0 to this difference, hence are absent from cov_nz_idx[t].
+  const std::vector<int> &idx = cov_nz_idx[t];
+  const std::vector<double> &val = cov_nz_val[t];
+  const int nnz = (int)idx.size();
 
-  // Gaussian prior on Lambda(k, t)
-  loglik += -0.5 * log(2.0 * PI_V * std::pow(sigma, 2.0));
-  loglik -= (std::pow((Lambda_eval - mu), 2.0) / (2.0 * std::pow(sigma, 2.0)));
-  return loglik;
+  double dd = 0.0;
+  for (int i = 0; i < nnz; ++i) {
+    const int d = idx[i];
+    const double c_old = Alpha(d, k);
+    const double s_old = alpha_sum(d);
+    const double c_new = c_old * std::exp(delta * val[i]);
+    const double s_new = s_old - c_old + c_new;
+    const double L_d = doc_each_len_weighted[d];
+    const double ndk = n_dk(d, k);
+
+    dd += mylgamma(s_new) - mylgamma(s_old);
+    dd -= mylgamma(L_d + s_new) - mylgamma(L_d + s_old);
+    dd -= mylgamma(c_new) - mylgamma(c_old);
+    dd += mylgamma(ndk + c_new) - mylgamma(ndk + c_old);
+  }
+  return dd;
+}
+
+void keyATMcov::commit_lambda(int k, int t, double delta, double Lambda_cand) {
+  const std::vector<int> &idx = cov_nz_idx[t];
+  const std::vector<double> &val = cov_nz_val[t];
+  const int nnz = (int)idx.size();
+
+  for (int i = 0; i < nnz; ++i) {
+    const int d = idx[i];
+    const double c_old = Alpha(d, k);
+    const double c_new = c_old * std::exp(delta * val[i]);
+    alpha_sum(d) += c_new - c_old; // += 0 for untouched docs -> exact no-op
+    Alpha(d, k) = c_new;
+  }
+  Lambda(k, t) = Lambda_cand;
 }
 
 void keyATMcov::sample_lambda() {
@@ -169,54 +207,35 @@ void keyATMcov::sample_lambda_mh() {
   topic_ids = sampler::shuffled_indexes(num_topics);
   cov_ids = sampler::shuffled_indexes(num_cov);
   const double mh_sigma = 0.4;
+  const double inv_2sigma2 = 1.0 / (2.0 * sigma * sigma);
   int k, t;
-
-  // Scratch buffers reused across the K * num_cov updates.
-  VectorXd col_old(num_doc);
-  VectorXd col_new(num_doc);
-  VectorXd sum_cand(num_doc);
-  VectorXd factor(num_doc);
-  VectorXd c_col_t(num_doc);
-  VectorXd n_dk_col_k(num_doc);
 
   for (int kk = 0; kk < num_topics; ++kk) {
     k = topic_ids[kk];
-
-    // n_dk is row-major; materialize a contiguous copy of column k once per
-    // topic so likelihood_lambda_eval's d-loop scans flat memory.
-    n_dk_col_k = n_dk.col(k);
 
     for (int tt = 0; tt < num_cov; ++tt) {
       t = cov_ids[tt];
 
       const double Lambda_init = Lambda(k, t);
-      col_old = Alpha.col(k);
-      c_col_t = C.col(t);
 
-      const double llk_current = likelihood_lambda_eval(
-          k, Lambda_init, col_old, alpha_sum, n_dk_col_k);
-
-      // Proposal
+      // Proposal (RNG order matches the original: rnorm then unif_rand).
       const double Lambda_cand = Lambda_init + R::rnorm(0.0, mh_sigma);
       const double delta = Lambda_cand - Lambda_init;
-      factor = (delta * c_col_t.array()).exp();
-      col_new = col_old.array() * factor.array();
-      sum_cand = alpha_sum - col_old + col_new;
 
-      const double llk_proposal = likelihood_lambda_eval(
-          k, Lambda_cand, col_new, sum_cand, n_dk_col_k);
+      // log p(cand) - log p(current). The doc-likelihood part is summed over
+      // the affected documents only; the Gaussian-prior constant cancels.
+      double diffllk = lambda_loglik_diff(k, t, delta);
+      diffllk -= (std::pow(Lambda_cand - mu, 2.0) -
+                  std::pow(Lambda_init - mu, 2.0)) *
+                 inv_2sigma2;
 
-      const double diffllk = llk_proposal - llk_current;
       const double r = std::min(0.0, diffllk);
       const double u = log(unif_rand());
 
       if (u < r) {
-        // accepted: commit
-        Lambda(k, t) = Lambda_cand;
-        Alpha.col(k) = col_new;
-        alpha_sum = sum_cand;
+        commit_lambda(k, t, delta, Lambda_cand);
       }
-      // rejected: nothing to roll back, no commit happened
+      // rejected: nothing committed, nothing to roll back
     }
   }
 }
@@ -225,67 +244,52 @@ void keyATMcov::sample_lambda_slice() {
   topic_ids = sampler::shuffled_indexes(num_topics);
   cov_ids = sampler::shuffled_indexes(num_cov);
   const double A = slice_A;
+  const double inv_2sigma2 = 1.0 / (2.0 * sigma * sigma);
   int k, t;
-
-  // Scratch buffers reused across the K * num_cov updates.
-  VectorXd col_old(num_doc);
-  VectorXd col_new(num_doc);
-  VectorXd sum_cand(num_doc);
-  VectorXd factor(num_doc);
-  VectorXd c_col_t(num_doc);
-  VectorXd n_dk_col_k(num_doc);
 
   for (int kk = 0; kk < num_topics; ++kk) {
     k = topic_ids[kk];
-
-    // n_dk is row-major; materialize a contiguous copy of column k once per
-    // topic so likelihood_lambda_eval's d-loop scans flat memory.
-    n_dk_col_k = n_dk.col(k);
 
     for (int tt = 0; tt < num_cov; ++tt) {
       t = cov_ids[tt];
 
       const double Lambda_init = Lambda(k, t);
-      col_old = Alpha.col(k);
-      c_col_t = C.col(t);
-
-      const double store_loglik = likelihood_lambda_eval(
-          k, Lambda_init, col_old, alpha_sum, n_dk_col_k);
 
       double start = val_min; // shrinked value
       double end = val_max;   // shrinked value
 
       const double previous_p = shrink(Lambda_init, A);
-      const double slice_ = store_loglik
-                            - std::log(A * previous_p * (1.0 - previous_p))
-                            + log(unif_rand()); // <-- using R random uniform
+
+      // The original test is slice_ < newlikelihood with
+      //   slice_        = store_loglik - log(A*p*(1-p)) + log(u)
+      //   newlikelihood = cand_llk     - log(A*np*(1-np))
+      // Subtracting the (state-independent) store_loglik from both sides leaves
+      //   base < diff - log(A*np*(1-np)),
+      // where base = log(u) - log(A*p*(1-p)) and diff = cand_llk - store_loglik
+      // is exactly what lambda_loglik_diff (+ the prior diff) returns. The
+      // unif draw stays in the same position in the RNG stream as before.
+      const double base =
+          log(unif_rand()) - std::log(A * previous_p * (1.0 - previous_p));
 
       for (int shrink_time = 0; shrink_time < max_shrink_time; ++shrink_time) {
         const double new_p = sampler::slice_uniform(start, end);
         const double Lambda_cand = expand(new_p, A); // expand
         const double delta = Lambda_cand - Lambda_init;
 
-        // Incremental update of column k of Alpha and the row sum.
-        //   Alpha_new(d, k) = Alpha_old(d, k) * exp(delta * C(d, t))
-        //   alpha_sum_new(d) = alpha_sum(d) - col_old(d) + col_new(d)
-        factor = (delta * c_col_t.array()).exp();
-        col_new = col_old.array() * factor.array();
-        sum_cand = alpha_sum - col_old + col_new;
+        double diff = lambda_loglik_diff(k, t, delta);
+        diff -= (std::pow(Lambda_cand - mu, 2.0) -
+                 std::pow(Lambda_init - mu, 2.0)) *
+                inv_2sigma2;
 
-        const double cand_llk = likelihood_lambda_eval(
-            k, Lambda_cand, col_new, sum_cand, n_dk_col_k);
-        const double newlikelihood =
-            cand_llk - std::log(A * new_p * (1.0 - new_p));
+        const double lhs = diff - std::log(A * new_p * (1.0 - new_p));
 
-        if (slice_ < newlikelihood) {
-          // Accept: commit candidate
-          Lambda(k, t) = Lambda_cand;
-          Alpha.col(k) = col_new;
-          alpha_sum = sum_cand;
+        if (base < lhs) {
+          // Accept: write Lambda and refresh the affected Alpha/alpha_sum entries
+          commit_lambda(k, t, delta, Lambda_cand);
           break;
         } else if (std::abs(end - start) < 1e-9) {
           Rcerr << "Shrinked too much. Using a current value." << std::endl;
-          // Keep Lambda(k, t), Alpha.col(k), and alpha_sum at their initial values.
+          // Nothing committed: Lambda, Alpha, and alpha_sum keep their values.
           break;
         } else if (previous_p < new_p) {
           end = new_p;

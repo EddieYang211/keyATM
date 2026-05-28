@@ -1,0 +1,19 @@
+# Build flags for keyATM's C++ sources.
+#
+# The covariates (DirMulti) sampler is dominated by per-document exp()/log()
+# and the mylgamma approximation. -march=native lets the compiler use the build
+# machine's SIMD/FMA instructions to vectorize those loops, which is the single
+# biggest "free" win for that workload.
+#
+# CAVEATS for cluster use:
+#   * -march=native bakes in the *build* node's instruction set. Build on the
+#     same CPU type you run on, or replace it with an explicit target
+#     (e.g. -march=x86-64-v3). It is intentionally NOT suitable for a package
+#     you intend to distribute / submit to CRAN -- drop it first if so.
+#   * R appends its own optimization flag (often -O2) AFTER PKG_CXXFLAGS, and
+#     the last -O wins, so adding -O3 here is usually overridden. To force -O3,
+#     set it in your personal ~/.R/Makevars instead, e.g.:
+#         CXXFLAGS = -O3 -march=native -funroll-loops
+#     (-march=native / -funroll-loops below are additive and DO take effect.)
+
+PKG_CXXFLAGS = -march=native -funroll-loops
